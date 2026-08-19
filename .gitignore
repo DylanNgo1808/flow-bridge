@@ -9,6 +9,12 @@ output/
 youtube
 agent/active_project.json
 
+# Isolated Chrome profiles and captured sessions — never commit
+.chrome-profile/
+.flow-bridge/
+*.cookies
+ya29.*
+
 # Generated AI tool configs (run: python setup.py)
 .claude/commands/fk-*
 .gemini/commands/

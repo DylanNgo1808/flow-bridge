@@ -1,54 +1,59 @@
-<p align="center">
-  <img src="docs/images/flowkit_banner.svg" width="720" alt="FLOW KIT" />
-</p>
+# Flow Bridge (internal, private)
 
-<p align="center">
-  <a href="#license"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python 3.10+"/>
-  <img src="https://img.shields.io/badge/Chrome-MV3-4285F4?logo=googlechrome&logoColor=white" alt="Chrome MV3"/>
-  <img src="https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white" alt="FastAPI"/>
-  <img src="https://img.shields.io/badge/ffmpeg-required-007808?logo=ffmpeg&logoColor=white" alt="ffmpeg"/>
-  <a href="CLAUDE.md"><img src="https://img.shields.io/badge/Docs-CLAUDE.md-8A2BE2" alt="Documentation"/></a>
-  <a href="https://github.com/tuannguyenhoangit-droid/google-flow-agent/stargazers"><img src="https://img.shields.io/github/stars/tuannguyenhoangit-droid/google-flow-agent?style=flat&logo=github" alt="GitHub stars"/></a>
-  <a href="https://github.com/tuannguyenhoangit-droid/google-flow-agent/issues"><img src="https://img.shields.io/github/issues/tuannguyenhoangit-droid/google-flow-agent?logo=github" alt="GitHub issues"/></a>
-  <a href="https://deepwiki.com/tuannguyenhoangit-droid/google-flow-agent"><img src="https://img.shields.io/badge/DeepWiki-AI%20Docs-6A3BC9" alt="DeepWiki"/></a>
-</p>
+Private copy of [crisng95/flowkit](https://github.com/crisng95/flowkit) (MIT) for **internal video generation** only.
+
+- **Not public.** Do not open the GitHub repo, publish the extension, or load it in a shared Chrome profile.
+- **Not Gavana.** Do not use this to generate lookalike campaign ads. Gavana lives in `gavana-content-pipeline` and uses official brand files only.
+- **Not Joy.** This is not the D2C brand-story factory.
+
+Chrome extension + local Python agent. The extension is a browser bridge to Google Flow (`labs.google/fx/tools/flow`). Credit, quota, and ToS sit on the Google account you sign into — so **test only with a dedicated account**. See [`docs/ACCOUNTS.md`](docs/ACCOUNTS.md).
+
+## Hard rules
+
+1. Load the extension only in the isolated Chrome profile launched by `scripts/chrome-test-profile.sh`.
+2. Sign that profile in with the **test** Google account. Never the main account.
+3. Agent binds `127.0.0.1` only. Do not expose `:8100` or `:9222`.
+4. Do not commit `.env`, cookies, `youtube/channels/*/token.json`, or the Chrome profile directory.
+5. Keep this GitHub repository **private**.
+
+## Test account — first run
+
+```bash
+# 1. Isolated Chrome (separate cookies / Google session)
+./scripts/chrome-test-profile.sh
+
+# In that Chrome window only:
+#   chrome://extensions → Developer mode → Load unpacked → extension/
+#   Sign in at https://labs.google/fx/tools/flow with the TEST account
+
+# 2. Agent
+./setup.sh
+source venv/bin/activate
+python -m agent.main
+
+# 3. Confirm the extension is talking to the agent
+curl -s http://127.0.0.1:8100/health
+# {"status":"ok","extension_connected":true}
+```
+
+If `extension_connected` is false, the Flow tab is in the wrong Chrome profile or the agent is not running.
+
+## Rate limits
+
+Local worker (defaults in `agent/config.py`):
+
+| Knob | Default |
+|---|---|
+| `MAX_CONCURRENT_REQUESTS` | 5 |
+| `API_COOLDOWN` | 10 seconds |
+| `MAX_RETRIES` | 5 |
+| `VIDEO_POLL_TIMEOUT` | 420 seconds |
+
+Google Flow still owns the real ceiling: daily credits, tier (`TIER_ONE` / `TIER_TWO` / Ultra), `429`, `USER_QUOTA_REACHED`, `UNUSUAL_ACTIVITY`. Check `GET /api/flow/credits`. Burst + VPN + main-account cookies is how sessions get flagged.
 
 ---
 
-### ☕ Sponsor this project
-
-<table align="center">
-  <tr>
-    <td align="center" width="50%">
-      <a href="docs/images/sponsor-qr-vn.jpg">
-        <img src="docs/images/sponsor-qr-vn.jpg" alt="Vietnam QR — MoMo / VietQR / napas247" width="240" />
-      </a><br/>
-      <sub>📱 <b>Vietnam</b><br/>MoMo · VietQR · napas247</sub>
-    </td>
-    <td align="center" width="50%">
-      <a href="docs/images/sponsor-qr-binance.png">
-        <img src="docs/images/sponsor-qr-binance.png" alt="Binance Pay QR — Cris Ng" width="240" />
-      </a><br/>
-      <sub>💰 <b>Binance Pay</b><br/>Crypto / cross-border</sub>
-    </td>
-  </tr>
-</table>
-
-<p align="center">
-  🌍 <b>International (card):</b>
-  <a href="https://ko-fi.com/crisnguyen95">
-    <img src="https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?logo=kofi&logoColor=white" alt="Ko-fi" />
-  </a>
-</p>
-
-<p align="center">
-  <sub><i>(yes — I moved this up here on purpose. Was afraid nobody scrolls past the badges 😅)</i></sub>
-</p>
-
----
-
-# FLOW KIT
+# Pipeline (upstream Flow Kit)
 
 Standalone system to generate AI videos via Google Flow API. Uses a Chrome extension as browser bridge for authentication, reCAPTCHA solving, and API proxying.
 

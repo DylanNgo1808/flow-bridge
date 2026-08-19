@@ -1,4 +1,6 @@
-# Flow Kit
+# Flow Bridge (internal)
+
+Private. Not Gavana. Not public. Test Google account only — see `docs/ACCOUNTS.md`.
 
 Base URL: `http://127.0.0.1:8100`
 

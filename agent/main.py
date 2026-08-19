@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 
     ops = init_sdk(get_flow_client())
     logger.info("SDK initialized (OperationService ready)")
-    logger.info("Flow Kit starting on %s:%d", API_HOST, API_PORT)
+    logger.info("Flow Bridge starting on %s:%d", API_HOST, API_PORT)
 
     controller = get_worker_controller()
 
@@ -110,10 +110,10 @@ async def lifespan(app: FastAPI):
     ws_task.cancel()
     worker_task.cancel()
     await close_db()
-    logger.info("Flow Kit stopped")
+    logger.info("Flow Bridge stopped")
 
 
-app = FastAPI(title="Flow Kit", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Flow Bridge", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

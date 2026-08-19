@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Flow Kit",
+  "name": "Flow Bridge (internal)",
   "version": "0.2.1",
-  "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
+  "description": "Private local agent bridge for Google Flow. Load only in the isolated test Chrome profile.",
   "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting", "declarativeNetRequest", "sidePanel"],
   "host_permissions": [
     "https://labs.google/*",
@@ -43,6 +43,6 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Flow Kit"
+    "default_title": "Flow Bridge (internal)"
   }
 }

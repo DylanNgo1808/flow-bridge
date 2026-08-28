@@ -1,0 +1,114 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.875rem;
+  --background: #212121;
+  --foreground: #ececec;
+  --card: #2f2f2f;
+  --card-foreground: #ececec;
+  --popover: #2f2f2f;
+  --popover-foreground: #ececec;
+  --primary: #ececec;
+  --primary-foreground: #212121;
+  --secondary: #3d3d3d;
+  --secondary-foreground: #ececec;
+  --muted: #3d3d3d;
+  --muted-foreground: #b4b4b4;
+  --accent: #3d3d3d;
+  --accent-foreground: #ececec;
+  --destructive: #f87171;
+  --border: #3e3e3e;
+  --input: #3e3e3e;
+  --ring: #8e8e8e;
+  --hello: #9db4c8;
+}
+
+.dark {
+  --background: #212121;
+  --foreground: #ececec;
+  --card: #2f2f2f;
+  --card-foreground: #ececec;
+  --popover: #2f2f2f;
+  --popover-foreground: #ececec;
+  --primary: #ececec;
+  --primary-foreground: #212121;
+  --secondary: #3d3d3d;
+  --secondary-foreground: #ececec;
+  --muted: #3d3d3d;
+  --muted-foreground: #b4b4b4;
+  --accent: #3d3d3d;
+  --accent-foreground: #ececec;
+  --destructive: #f87171;
+  --border: #3e3e3e;
+  --input: #3e3e3e;
+  --ring: #8e8e8e;
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-sans);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 280px;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}

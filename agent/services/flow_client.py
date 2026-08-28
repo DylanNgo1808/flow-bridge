@@ -34,6 +34,7 @@ class FlowClient:
         self._ws_disconnect_count = 0
         self._ws_connected_at: Optional[float] = None
         self._ws_last_disconnect_at: Optional[float] = None
+        self._last_flow_generate: Optional[dict] = None
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -188,6 +189,18 @@ class FlowClient:
         if data.get("type") == "extension_ready":
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
             asyncio.create_task(self._sync_tier())
+            return
+
+        if data.get("type") == "flow_generate_capture":
+            capture = data.get("capture")
+            if isinstance(capture, dict):
+                self._last_flow_generate = capture
+                logger.info(
+                    "Captured Flow generate keys=%s parts=%s likeness=%s",
+                    capture.get("requestKeys"),
+                    capture.get("partKinds") or capture.get("parts"),
+                    capture.get("likenessHints"),
+                )
             return
 
         if data.get("type") == "media_urls_refresh":
@@ -514,7 +527,10 @@ class FlowClient:
         - start_end_frame_2_video (i2v_fl): startImage + endImage (for scene chaining)
         """
         gen_type = "start_end_frame_2_video" if end_image_media_id else "frame_2_video"
-        model_key = VIDEO_MODELS.get(user_paygate_tier, {}).get(gen_type, {}).get(aspect_ratio)
+        model_key = (
+            VIDEO_MODELS.get(user_paygate_tier, {}).get(gen_type, {}).get(aspect_ratio)
+            or VIDEO_MODELS.get("PAYGATE_TIER_ONE", {}).get(gen_type, {}).get(aspect_ratio)
+        )
 
         if not model_key:
             return {"error": f"No model for tier={user_paygate_tier} type={gen_type} ratio={aspect_ratio}"}
@@ -561,7 +577,10 @@ class FlowClient:
             reference_media_ids: List of character media_ids (from uploadImage)
         """
         gen_type = "reference_frame_2_video"
-        model_key = VIDEO_MODELS.get(user_paygate_tier, {}).get(gen_type, {}).get(aspect_ratio)
+        model_key = (
+            VIDEO_MODELS.get(user_paygate_tier, {}).get(gen_type, {}).get(aspect_ratio)
+            or VIDEO_MODELS.get("PAYGATE_TIER_ONE", {}).get(gen_type, {}).get(aspect_ratio)
+        )
 
         if not model_key:
             return {"error": f"No model for tier={user_paygate_tier} type={gen_type} ratio={aspect_ratio}"}

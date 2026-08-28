@@ -12,7 +12,7 @@ Chrome extension + local Python agent. The extension is a browser bridge to Goog
 
 1. Load the extension only in the isolated Chrome profile launched by `scripts/chrome-test-profile.sh`.
 2. Sign that profile in with the **test** Google account. Never the main account.
-3. Agent binds `127.0.0.1` only. Do not expose `:8100` or `:9222`.
+3. Agent binds `127.0.0.1` only. Do not expose `:8100` or `:18765`.
 4. Do not commit `.env`, cookies, `youtube/channels/*/token.json`, or the Chrome profile directory.
 5. Keep this GitHub repository **private**.
 
@@ -24,7 +24,12 @@ Chrome extension + local Python agent. The extension is a browser bridge to Goog
 
 # In that Chrome window only:
 #   chrome://extensions → Developer mode → Load unpacked → extension/
+#   Toolbar icon opens the Chrome side panel (not a popup)
 #   Sign in at https://labs.google/fx/tools/flow with the TEST account
+#
+# After changing the side panel UI:
+#   cd extension-ui && npm install && npm run build
+#   then Reload the unpacked extension
 
 # 2. Agent
 ./setup.sh
@@ -619,7 +624,7 @@ Materials control both entity `image_prompt` style and scene `scene_prefix`. Exa
 | `API_HOST` | `127.0.0.1` | REST API bind address |
 | `API_PORT` | `8100` | REST API port |
 | `WS_HOST` | `127.0.0.1` | WebSocket server bind |
-| `WS_PORT` | `9222` | WebSocket server port |
+| `WS_PORT` | `18765` | WebSocket server port (9222 is taken by Chrome on this Mac) |
 | `POLL_INTERVAL` | `5` | Worker poll interval (seconds) |
 | `MAX_RETRIES` | `5` | Max retries per request |
 | `VIDEO_POLL_TIMEOUT` | `420` | Video gen poll timeout (seconds) |

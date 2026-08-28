@@ -3,8 +3,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
+const extensionDir = path.join(__dirname, '..', 'extension');
 const source = fs.readFileSync(
-  path.join(__dirname, '..', 'extension', 'background.js'),
+  path.join(extensionDir, 'background.js'),
   'utf8',
 );
 
@@ -38,6 +39,7 @@ function event(bucket) {
 
 const chrome = {
   action: { setBadgeBackgroundColor() {}, setBadgeText() {} },
+  sidePanel: { setPanelBehavior: async () => {} },
   alarms: { clear() {}, create() {}, onAlarm: event(lifecycleListeners.alarm) },
   runtime: {
     onInstalled: event(lifecycleListeners.installed),
@@ -65,13 +67,22 @@ const chrome = {
     sendMessage: async () => {},
     update: async () => {},
   },
-  webRequest: { onBeforeSendHeaders: event() },
+  webRequest: {
+    onBeforeSendHeaders: event(),
+    onBeforeRequest: event(),
+  },
 };
 
 const context = vm.createContext({
   URL,
   WebSocket: FakeWebSocket,
   chrome,
+  importScripts(...files) {
+    for (const file of files) {
+      const helper = fs.readFileSync(path.join(extensionDir, file), 'utf8');
+      vm.runInContext(helper, context, { filename: file });
+    }
+  },
   clearInterval() {},
   clearTimeout() {},
   console,

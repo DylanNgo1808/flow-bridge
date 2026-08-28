@@ -13,7 +13,7 @@ API_PORT = int(os.environ.get("API_PORT", "8100"))
 
 # ─── WebSocket Server (extension connects here) ─────────────
 WS_HOST = os.environ.get("WS_HOST", "127.0.0.1")
-WS_PORT = int(os.environ.get("WS_PORT", "9222"))
+WS_PORT = int(os.environ.get("WS_PORT", "18765"))
 
 # ─── Google Flow API ────────────────────────────────────────
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
@@ -43,6 +43,7 @@ ENDPOINTS = {
     "generate_images": "/v1/projects/{project_id}/flowMedia:batchGenerateImages",
     "generate_video": "/v1/video:batchAsyncGenerateVideoStartImage",
     "generate_video_start_end": "/v1/video:batchAsyncGenerateVideoStartAndEndImage",
+    "generate_video_text": "/v1/video:batchAsyncGenerateVideoText",
     "generate_video_references": "/v1/video:batchAsyncGenerateVideoReferenceImages",
     "upscale_video": "/v1/video:batchAsyncGenerateVideoUpsampleVideo",
     "upscale_image": "/v1/flow/upsampleImage",

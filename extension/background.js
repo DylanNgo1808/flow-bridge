@@ -5,7 +5,9 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const AGENT_WS_URL = 'ws://127.0.0.1:9222';
+importScripts('flow_payload.js');
+
+const AGENT_WS_URL = 'ws://127.0.0.1:18765';
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
 
@@ -26,6 +28,8 @@ let metrics = {
 
 // Visible log types — only these appear in the request log
 const _VISIBLE_TYPES = new Set(['GEN_IMG', 'GEN_VID', 'GEN_VID_REF', 'UPSCALE', 'TRACKING', 'URL_REFRESH']);
+// These Flow calls return 200 when the job is *accepted*, not when the clip exists.
+const _ASYNC_SUBMIT_TYPES = new Set(['GEN_VID', 'GEN_VID_REF', 'UPSCALE']);
 
 function _classifyApiUrl(url) {
   if (url.includes('uploadImage'))                     return 'UPLOAD';
@@ -38,6 +42,16 @@ function _classifyApiUrl(url) {
   if (url.includes('/media/'))                         return 'MEDIA';
   if (url.includes('/credits'))                        return 'CREDITS';
   return 'API';
+}
+
+let lastFlowGenerate = null;
+
+function rememberFlowGenerate(opts) {
+  if (!opts || (!opts.videoModelKey && !opts.videoResolution && !opts.requestKeys)) return;
+  lastFlowGenerate = opts;
+  chrome.storage.local.set({ lastFlowGenerate: opts }).catch(() => {});
+  sendToAgent({ type: 'flow_generate_capture', capture: opts });
+  broadcastStatus();
 }
 
 // ─── Request Log ────────────────────────────────────────────
@@ -53,6 +67,49 @@ function addRequestLog(entry) {
 function updateRequestLog(id, updates) {
   const entry = requestLog.find((e) => e.id === id);
   if (entry) Object.assign(entry, updates);
+  broadcastRequestLog();
+}
+
+function _opNamesFromPayload(payload) {
+  const root = payload?.data && typeof payload.data === 'object' ? payload.data : (payload || {});
+  const names = [];
+  for (const op of root.operations || []) {
+    const name = op?.operation?.name;
+    if (name) names.push(name);
+  }
+  for (const wf of root.workflows || []) {
+    if (wf?.name) names.push(wf.name);
+  }
+  return names;
+}
+
+function _opsTerminalStatus(payload) {
+  const root = payload?.data && typeof payload.data === 'object' ? payload.data : (payload || {});
+  const ops = root.operations || [];
+  if (!ops.length) return null;
+  if (ops.every((op) => op.status === 'MEDIA_GENERATION_STATUS_SUCCESSFUL')) return 'success';
+  if (ops.some((op) => op.status === 'MEDIA_GENERATION_STATUS_FAILED')) return 'failed';
+  return 'processing';
+}
+
+function _markAsyncJobs(names, updates) {
+  const nameSet = new Set(names || []);
+  let hit = false;
+  for (const entry of requestLog) {
+    if (!_ASYNC_SUBMIT_TYPES.has(entry.type)) continue;
+    if (entry.status === 'success' || entry.status === 'failed') continue;
+    const match = (entry.opNames || []).some((n) => nameSet.has(n));
+    if (match) {
+      Object.assign(entry, updates);
+      hit = true;
+    }
+  }
+  if (!hit) {
+    const pending = requestLog.find(
+      (e) => _ASYNC_SUBMIT_TYPES.has(e.type) && e.status === 'processing',
+    );
+    if (pending) Object.assign(pending, updates);
+  }
   broadcastRequestLog();
 }
 
@@ -83,18 +140,21 @@ function ensureInitialized() {
   if (!initializationPromise) {
     initializationPromise = initialize().catch((error) => {
       initializationPromise = null;
-      console.error('[FlowAgent] Initialization failed', error);
-      throw error;
+      console.warn('[FlowAgent] Initialization failed', error);
     });
   }
   return initializationPromise;
 }
 
 async function initialize() {
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret']);
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'lastFlowGenerate']);
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  if (data.lastFlowGenerate) lastFlowGenerate = data.lastFlowGenerate;
+  if (chrome.sidePanel?.setPanelBehavior) {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  }
   connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
 }
@@ -130,6 +190,26 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   },
   { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
   ['requestHeaders', 'extraHeaders'],
+);
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    try {
+      if (details.method !== 'POST') return;
+      const url = details.url || '';
+      if (!url.includes('batchAsyncGenerateVideo') && !url.includes('batchGenerateImages')) return;
+      const bytes = details.requestBody?.raw?.[0]?.bytes;
+      if (!bytes) return;
+      const text = new TextDecoder('utf-8').decode(bytes);
+      const body = JSON.parse(text);
+      const opts = extractGenerateOptions(body, url);
+      if (opts) rememberFlowGenerate(opts);
+    } catch {
+      /* ignore malformed page bodies */
+    }
+  },
+  { urls: ['https://aisandbox-pa.googleapis.com/*'] },
+  ['requestBody'],
 );
 
 let _openingFlowTab = false;
@@ -251,8 +331,9 @@ function connectToAgent() {
     if (!manualDisconnect) scheduleReconnect();
   };
 
-  ws.onerror = (e) => {
-    console.error('[FlowAgent] WS error:', e);
+  ws.onerror = () => {
+    // Expected when the agent is down or reconnecting. Do not console.error —
+    // Chrome treats SW console.error as the red Errors badge on chrome://extensions.
     metrics.lastError = 'WS_ERROR';
     chrome.storage.local.set({ metrics });
   };
@@ -449,7 +530,7 @@ async function handleApiRequest(msg) {
   const logId = id;
   const logType = _classifyApiUrl(url);
   if (_VISIBLE_TYPES.has(logType)) {
-    const payloadSummary = body ? JSON.stringify(body).slice(0, 200) : null;
+    const payloadSummary = summarizeGenerateBody(body) || (body ? JSON.stringify(body).slice(0, 200) : null);
     addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null, url, payloadSummary });
   }
 
@@ -472,20 +553,26 @@ async function handleApiRequest(msg) {
       }
     }
 
-    // Step 2: Inject captcha token into body
+    // Step 2: Inject captcha token + Omni 1.1 resolution (360p/720p)
     let finalBody = body;
-    if (captchaToken && finalBody) {
+    if (finalBody) {
       finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
-      if (finalBody.clientContext?.recaptchaContext) {
-        finalBody.clientContext.recaptchaContext.token = captchaToken;
-      }
-      if (finalBody.requests && Array.isArray(finalBody.requests)) {
-        for (const req of finalBody.requests) {
-          if (req.clientContext?.recaptchaContext) {
-            req.clientContext.recaptchaContext.token = captchaToken;
+      if (captchaToken) {
+        if (finalBody.clientContext?.recaptchaContext) {
+          finalBody.clientContext.recaptchaContext.token = captchaToken;
+        }
+        if (finalBody.requests && Array.isArray(finalBody.requests)) {
+          for (const req of finalBody.requests) {
+            if (req.clientContext?.recaptchaContext) {
+              req.clientContext.recaptchaContext.token = captchaToken;
+            }
           }
         }
       }
+      const capturedRes = lastFlowGenerate?.videoResolution || lastFlowGenerate?.resolutionLabel;
+      injectOmniResolution(finalBody, capturedRes || OMNI_DEFAULT_RESOLUTION);
+      const sent = extractGenerateOptions(finalBody, url);
+      if (sent) rememberFlowGenerate(sent);
     }
 
     // Step 3: Use flowKey for auth
@@ -525,12 +612,40 @@ async function handleApiRequest(msg) {
     });
 
     const responseSummary = responseText ? responseText.slice(0, 300) : null;
+    const opNames = _opNamesFromPayload(responseData);
     if (response.ok) {
-      if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
-      updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary });
+      if (_ASYNC_SUBMIT_TYPES.has(logType)) {
+        const terminal = _opsTerminalStatus(responseData);
+        if (terminal === 'success') {
+          if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
+          updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary, opNames });
+        } else if (terminal === 'failed') {
+          if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'VIDEO_FAILED'; }
+          updateRequestLog(logId, { status: 'failed', error: 'VIDEO_FAILED', httpStatus: response.status, responseSummary, opNames });
+        } else {
+          // 200 = accepted / still rendering. Do not badge as done.
+          updateRequestLog(logId, { status: 'processing', httpStatus: response.status, responseSummary, opNames });
+        }
+      } else if (logType === 'POLL') {
+        const terminal = _opsTerminalStatus(responseData);
+        const names = opNames.length ? opNames : _opNamesFromPayload(body);
+        if (terminal === 'success') {
+          if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
+          _markAsyncJobs(names, { status: 'success' });
+        } else if (terminal === 'failed') {
+          if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'VIDEO_FAILED'; }
+          _markAsyncJobs(names, { status: 'failed', error: 'VIDEO_FAILED' });
+        }
+      } else {
+        if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
+        updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary });
+      }
     } else {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
       updateRequestLog(logId, { status: 'failed', error: `API_${response.status}`, httpStatus: response.status, responseSummary });
+      if (_ASYNC_SUBMIT_TYPES.has(logType)) {
+        updateRequestLog(logId, { opNames });
+      }
     }
   } catch (e) {
     sendToAgent({
@@ -576,6 +691,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
         lastError: metrics.lastError,
       },
       state,
+      flowGenerate: lastFlowGenerate,
     });
   }
 
@@ -630,6 +746,31 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'TRPC_MEDIA_URLS') {
     handleTrpcMediaUrls(msg.trpcUrl, msg.body);
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'FLOW_GENERATE_CAPTURE') {
+    const opts = msg.options || extractGenerateOptions(msg.body, msg.url);
+    if (opts && msg.body && typeof msg.body === 'object') {
+      const first = Array.isArray(msg.body.requests) ? (msg.body.requests[0] || {}) : {};
+      const parts = first?.textInput?.structuredPrompt?.parts
+        || first?.structuredPrompt?.parts
+        || [];
+      opts.bodyKeys = Object.keys(msg.body);
+      opts.requestKeys = Object.keys(first);
+      opts.parts = parts.map((p) => {
+        if (!p || typeof p !== 'object') return p;
+        const copy = {};
+        for (const [k, v] of Object.entries(p)) {
+          copy[k] = (typeof v === 'string' && /bytes$/i.test(k))
+            ? `<${k} ${v.length} chars>`
+            : v;
+        }
+        return copy;
+      });
+    }
+    if (opts) rememberFlowGenerate(opts);
     reply({ ok: true });
     return true;
   }

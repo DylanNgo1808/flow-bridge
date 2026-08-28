@@ -8,6 +8,7 @@ from agent.services.omni_flash import (
     check_omni_flash_status,
     generate_omni_flash_first_frame_video,
     generate_omni_flash_first_last_video,
+    generate_omni_flash_text_video,
     generate_omni_flash_video,
 )
 
@@ -33,6 +34,8 @@ class GenerateVideoRequest(BaseModel):
     # Backward compatible: legacy requests remain Veo unless explicitly set.
     model_family: Literal["veo", "omni_flash"] = "veo"
     duration_s: int = 8
+    resolution: str = "360p"
+    count: int = 1
 
 
 class GenerateVideoRefsRequest(BaseModel):
@@ -46,16 +49,35 @@ class GenerateVideoRefsRequest(BaseModel):
     # explicitly opt into Omni Flash.
     model_family: Literal["veo", "omni_flash"] = "veo"
     duration_s: int = 8
+    resolution: str = "360p"
+    count: int = 1
 
 
 class GenerateOmniFlashVideoRequest(BaseModel):
-    reference_media_ids: list[str]
+    reference_media_ids: list[str] = []
     prompt: str
     project_id: str
     scene_id: str = ""
     duration_s: int = 8
     aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT"
     user_paygate_tier: str = "PAYGATE_TIER_ONE"
+    resolution: str = "360p"
+    count: int = 1
+    likeness_id: Optional[str] = None
+    likeness_handle: str = "me"
+
+
+class GenerateOmniTextVideoRequest(BaseModel):
+    prompt: str
+    project_id: str
+    scene_id: str = ""
+    duration_s: int = 8
+    aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT"
+    user_paygate_tier: str = "PAYGATE_TIER_ONE"
+    resolution: str = "360p"
+    count: int = 1
+    likeness_id: Optional[str] = None
+    likeness_handle: str = "me"
 
 
 class UpscaleVideoRequest(BaseModel):
@@ -103,6 +125,13 @@ async def extension_status():
         "connected": client.connected,
         "flow_key_present": client._flow_key is not None,
     }
+
+
+@router.get("/last-generate")
+async def last_generate():
+    """Last Flow generate payload captured from the live UI or a bridge submit."""
+    client = get_flow_client()
+    return {"capture": getattr(client, "_last_flow_generate", None)}
 
 
 @router.get("/credits")
@@ -155,6 +184,8 @@ async def generate_video(body: GenerateVideoRequest):
                 duration_s=body.duration_s,
                 aspect_ratio=body.aspect_ratio,
                 user_paygate_tier=body.user_paygate_tier,
+                resolution=body.resolution,
+                count=body.count,
             )
             if body.end_image_media_id:
                 result = await generate_omni_flash_first_last_video(
@@ -167,7 +198,10 @@ async def generate_video(body: GenerateVideoRequest):
             raise HTTPException(400, str(exc)) from exc
     else:
         result = await client.generate_video(
-            **body.model_dump(exclude={"model_family", "duration_s"}, exclude_none=True)
+            **body.model_dump(
+                exclude={"model_family", "duration_s", "resolution", "count"},
+                exclude_none=True,
+            )
         )
 
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
@@ -198,12 +232,14 @@ async def generate_video_refs(body: GenerateVideoRefsRequest):
                 duration_s=body.duration_s,
                 aspect_ratio=body.aspect_ratio,
                 user_paygate_tier=body.user_paygate_tier,
+                resolution=body.resolution,
+                count=body.count,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     else:
         result = await client.generate_video_from_references(
-            **body.model_dump(exclude={"model_family", "duration_s"})
+            **body.model_dump(exclude={"model_family", "duration_s", "resolution", "count"})
         )
 
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
@@ -227,6 +263,28 @@ async def generate_video_omni(body: GenerateOmniFlashVideoRequest):
         raise HTTPException(400, str(exc)) from exc
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
         raise HTTPException(result.get("status", 502), result.get("error", result.get("data")))
+    return result.get("data", result)
+
+
+@router.post("/generate-video-text")
+async def generate_video_text(body: GenerateOmniTextVideoRequest):
+    """Submit Omni Flash text-to-video, optionally with a Flow ``@me`` avatar.
+
+    Pass ``likeness_id`` (from projectContents.likenesses) so Flow uses the
+    recorded visual + voice, not a still start frame.
+    """
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    try:
+        result = await generate_omni_flash_text_video(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
+        raise HTTPException(
+            result.get("status", 502),
+            result.get("data") or result.get("error"),
+        )
     return result.get("data", result)
 
 
@@ -292,6 +350,99 @@ async def check_omni_status(body: CheckOmniStatusRequest):
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+@router.get("/project-contents/{project_id}")
+async def project_contents(project_id: str):
+    """Slim Flow project snapshot — workflows + media status/urls."""
+    from agent.services.omni_flash import _fetch_project_initial_data
+
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    response = await _fetch_project_initial_data(client, project_id)
+    envelope = response.get("data") if isinstance(response, dict) else None
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    result_data = result.get("data") if isinstance(result, dict) else None
+    project_json = result_data.get("json") if isinstance(result_data, dict) else None
+    contents = project_json.get("projectContents") if isinstance(project_json, dict) else None
+    if not isinstance(contents, dict):
+        raise HTTPException(502, "Flow project snapshot missing projectContents")
+
+    media_out = []
+    for item in contents.get("media") or []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("mediaMetadata") if isinstance(item.get("mediaMetadata"), dict) else {}
+        status = ((meta.get("mediaStatus") or {}) if isinstance(meta.get("mediaStatus"), dict) else {})
+        video = item.get("video") if isinstance(item.get("video"), dict) else {}
+        request_data = meta.get("requestData") if isinstance(meta.get("requestData"), dict) else {}
+
+        def _slim_rd(obj, depth=0):
+            if depth > 5:
+                return "..."
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in list(obj.items())[:50]:
+                    if isinstance(v, str) and (k.lower().endswith("bytes") or len(v) > 240):
+                        out[k] = f"<{len(v)} chars>"
+                    else:
+                        out[k] = _slim_rd(v, depth + 1)
+                return out
+            if isinstance(obj, list):
+                return [_slim_rd(x, depth + 1) for x in obj[:6]]
+            return obj
+
+        media_out.append({
+            "name": item.get("name"),
+            "workflowId": item.get("workflowId"),
+            "generation_status": status.get("mediaGenerationStatus"),
+            "fifeUrl": video.get("fifeUrl") or video.get("videoUri") or video.get("servingUri"),
+            "has_encoded_video": bool(video.get("encodedVideo")),
+            "meta_title": meta.get("mediaTitle"),
+            "request_data": _slim_rd(request_data),
+        })
+    extra = {}
+    for key in contents:
+        if key in ("media", "workflows"):
+            continue
+        val = contents.get(key)
+        if isinstance(val, list):
+            slim = []
+            for item in val[:30]:
+                if not isinstance(item, dict):
+                    slim.append(item)
+                    continue
+                copy = {
+                    k: (f"<{k} {len(v)} chars>" if k.lower().endswith("bytes") and isinstance(v, str) else v)
+                    for k, v in item.items()
+                }
+                slim.append(copy)
+            extra[key] = slim
+        elif isinstance(val, dict):
+            extra[key] = {"_keys": list(val.keys())[:40], **{k: val[k] for k in list(val)[:8]}}
+        else:
+            extra[key] = val
+
+    workflows_out = []
+    for w in contents.get("workflows") or []:
+        if not isinstance(w, dict):
+            continue
+        meta = w.get("metadata") if isinstance(w.get("metadata"), dict) else {}
+        workflows_out.append({
+            "name": w.get("name"),
+            "primaryMediaId": meta.get("primaryMediaId"),
+            "displayName": meta.get("displayName"),
+        })
+
+    return {
+        "project_id": project_id,
+        "content_keys": list(contents.keys()),
+        "project_keys": list(project_json.keys()) if isinstance(project_json, dict) else [],
+        "workflows": workflows_out,
+        "media": media_out,
+        "extra": extra,
+    }
 
 
 @router.post("/refresh-urls/{project_id}")

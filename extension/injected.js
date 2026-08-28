@@ -24,6 +24,19 @@ window.fetch = async function (...args) {
         }
       }).catch(() => {});
     }
+    if (url.includes('aisandbox-pa.googleapis.com') && (
+      url.includes('batchAsyncGenerateVideo') || url.includes('batchGenerateImages')
+    )) {
+      try {
+        const init = args[1] || {};
+        const raw = init.body;
+        if (typeof raw === 'string' && raw.includes('videoModelKey')) {
+          window.dispatchEvent(new CustomEvent('FLOW_GENERATE_CAPTURE', {
+            detail: { url, body: raw },
+          }));
+        }
+      } catch {}
+    }
   } catch {}
   return response;
 };

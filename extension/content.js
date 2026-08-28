@@ -47,3 +47,17 @@ window.addEventListener('TRPC_MEDIA_URLS', (e) => {
     body,
   }).catch(() => {});
 });
+
+window.addEventListener('FLOW_GENERATE_CAPTURE', (e) => {
+  const { url, body } = e.detail || {};
+  if (!body) return;
+  let parsed = body;
+  if (typeof body === 'string') {
+    try { parsed = JSON.parse(body); } catch { return; }
+  }
+  chrome.runtime.sendMessage({
+    type: 'FLOW_GENERATE_CAPTURE',
+    url,
+    body: parsed,
+  }).catch(() => {});
+});

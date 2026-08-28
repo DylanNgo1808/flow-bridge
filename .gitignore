@@ -10,6 +10,10 @@ youtube
 agent/active_project.json
 
 # Isolated Chrome profiles and captured sessions — never commit
+.DS_Store
+extension/_metadata/
+extension-ui/node_modules/
+extension-ui/dist/
 .chrome-profile/
 .flow-bridge/
 *.cookies

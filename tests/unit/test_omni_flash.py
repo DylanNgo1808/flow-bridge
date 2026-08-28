@@ -13,6 +13,7 @@ from agent.services.omni_flash import (
     extract_omni_workflows,
     generate_omni_flash_first_frame_video,
     generate_omni_flash_first_last_video,
+    generate_omni_flash_text_video,
     generate_omni_flash_video,
 )
 
@@ -54,6 +55,64 @@ def test_omni_first_frame_model_keys(duration, expected):
 )
 def test_omni_first_last_model_keys_are_independently_configured(duration, expected):
     assert _load_model_key(duration, mode="start_end_frame_to_video") == expected
+
+
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [
+        (4, "abra_t2v_4s"),
+        (6, "abra_t2v_6s"),
+        (8, "abra_t2v_8s"),
+        (10, "abra_t2v_10s"),
+    ],
+)
+def test_omni_text_duration_model_keys(duration, expected):
+    assert _load_model_key(duration, mode="text_to_video") == expected
+
+
+def test_omni_360p_appends_model_key_suffix():
+    assert _load_model_key(6, resolution="360p") == "abra_r2v_6s_360p"
+    assert _load_model_key(6, mode="text_to_video", resolution="360p") == "abra_t2v_6s_360p"
+    assert _load_model_key(6, resolution="720p") == "abra_r2v_6s"
+
+
+@pytest.mark.asyncio
+async def test_submit_builds_flow_omni_t2v_with_me_avatar():
+    client = _mock_submit_client()
+
+    with patch("agent.services.omni_flash.get_flow_client", return_value=client):
+        result = await generate_omni_flash_text_video(
+            prompt='talking to camera, saying "hello"',
+            project_id="project-1",
+            scene_id="scene-1",
+            duration_s=6,
+            aspect_ratio="VIDEO_ASPECT_RATIO_PORTRAIT",
+            user_paygate_tier="PAYGATE_TIER_TIER1P5",
+            seed=7,
+            likeness_id="f53ba86c-dbc2-2a85-0000-000000000000",
+            likeness_handle="me",
+            resolution="360p",
+        )
+
+    client._build_url.assert_called_once_with("generate_video_references")
+    method, params = client._send.await_args.args[:2]
+    assert method == "api_request"
+    body = params["body"]
+    request = body["requests"][0]
+    assert request["videoModelKey"] == "abra_r2v_6s_360p"
+    assert request["referenceLikenesses"] == [
+        {"likenessId": "f53ba86c-dbc2-2a85-0000-000000000000"}
+    ]
+    assert "outputSpec" not in request
+    parts = request["textInput"]["structuredPrompt"]["parts"]
+    assert parts[0]["reference"]["likeness"] == {
+        "handle": "me",
+        "likenessId": "f53ba86c-dbc2-2a85-0000-000000000000",
+    }
+    assert "hello" in parts[1]["text"]
+    assert "startImage" not in request
+    assert "referenceImages" not in request
+    assert result["data"]["flowkitPolling"]["project_id"] == "project-1"
 
 
 def test_invalid_duration_fails_before_submit():
@@ -144,7 +203,10 @@ async def test_submit_builds_flow_omni_first_frame_request_and_poll_descriptor()
     assert body["useV2ModelConfig"] is True
     assert set(body["mediaGenerationContext"]) == {"batchId"}
     request = body["requests"][0]
-    assert request["videoModelKey"] == "abra_i2v_10s"
+    assert request["videoModelKey"] == "abra_i2v_10s_360p"
+    assert "videoModelControlInput" not in request
+    assert "resolution" not in request
+    assert "outputSpec" not in request
     assert request["startImage"] == {"mediaId": "start-1"}
     assert "endImage" not in request
     assert request["seed"] == 321
@@ -174,7 +236,7 @@ async def test_submit_builds_flow_omni_first_last_request():
     assert method == "api_request"
     body = params["body"]
     request = body["requests"][0]
-    assert request["videoModelKey"] == "abra_i2v_8s"
+    assert request["videoModelKey"] == "abra_i2v_8s_360p"
     assert request["startImage"] == {"mediaId": "start-1"}
     assert request["endImage"] == {"mediaId": "end-1"}
     assert request["aspectRatio"] == "VIDEO_ASPECT_RATIO_PORTRAIT"
@@ -250,7 +312,9 @@ async def test_submit_builds_flow_omni_r2v_request_and_poll_descriptor():
     assert body["clientContext"]["projectId"] == "project-1"
 
     request = body["requests"][0]
-    assert request["videoModelKey"] == "abra_r2v_10s"
+    assert request["videoModelKey"] == "abra_r2v_10s_360p"
+    assert "videoModelControlInput" not in request
+    assert "outputSpec" not in request
     assert request["aspectRatio"] == "VIDEO_ASPECT_RATIO_LANDSCAPE"
     assert request["seed"] == 123
     assert request["metadata"] == {"sceneId": "scene-1"}
@@ -418,6 +482,30 @@ async def test_omni_poll_requires_project_id_for_legacy_descriptors():
         await check_omni_flash_status(
             [{"name": "workflow-1", "primary_media_id": "media-1"}]
         )
+
+
+@pytest.mark.asyncio
+async def test_submit_omni_720p_and_count_duplicates_requests():
+    client = _mock_submit_client()
+
+    with patch("agent.services.omni_flash.get_flow_client", return_value=client):
+        await generate_omni_flash_first_frame_video(
+            start_image_media_id="start-1",
+            prompt="test",
+            project_id="project-1",
+            duration_s=8,
+            seed=10,
+            resolution="720p",
+            count=2,
+        )
+
+    body = client._send.await_args.args[1]["body"]
+    assert len(body["requests"]) == 2
+    assert "videoModelControlInput" not in body["requests"][0]
+    assert "outputSpec" not in body["requests"][0]
+    assert body["requests"][0]["videoModelKey"] == "abra_i2v_8s"
+    assert body["requests"][0]["seed"] == 10
+    assert body["requests"][1]["seed"] == 11
 
 
 @pytest.mark.asyncio

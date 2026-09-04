@@ -5,11 +5,27 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-importScripts('flow_payload.js');
+importScripts('flow_payload.js', 'request_log.js');
 
 const AGENT_WS_URL = 'ws://127.0.0.1:18765';
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
+
+// Google moved Flow from labs.google/fx/tools/flow → flow.google.com.
+const FLOW_HOME_URL = 'https://flow.google.com/';
+const FLOW_TAB_URLS = [
+  'https://flow.google.com/*',
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+];
+
+function isFlowPageUrl(url) {
+  if (!url) return false;
+  return (
+    url.startsWith('https://flow.google.com/') ||
+    url.startsWith('https://labs.google/')
+  );
+}
 
 let ws = null;
 let flowKey = null;
@@ -70,47 +86,63 @@ function updateRequestLog(id, updates) {
   broadcastRequestLog();
 }
 
-function _opNamesFromPayload(payload) {
-  const root = payload?.data && typeof payload.data === 'object' ? payload.data : (payload || {});
-  const names = [];
-  for (const op of root.operations || []) {
-    const name = op?.operation?.name;
-    if (name) names.push(name);
+function _completeAsyncEntry(entry, updates) {
+  if (!entry) return false;
+  if (entry.status === 'success' || entry.status === 'failed') return false;
+  Object.assign(entry, updates);
+  if (updates.status === 'success') {
+    metrics.successCount++;
+    metrics.lastError = null;
+  } else if (updates.status === 'failed') {
+    metrics.failedCount++;
+    metrics.lastError = updates.error || 'VIDEO_FAILED';
   }
-  for (const wf of root.workflows || []) {
-    if (wf?.name) names.push(wf.name);
-  }
-  return names;
+  return true;
 }
 
-function _opsTerminalStatus(payload) {
-  const root = payload?.data && typeof payload.data === 'object' ? payload.data : (payload || {});
-  const ops = root.operations || [];
-  if (!ops.length) return null;
-  if (ops.every((op) => op.status === 'MEDIA_GENERATION_STATUS_SUCCESSFUL')) return 'success';
-  if (ops.some((op) => op.status === 'MEDIA_GENERATION_STATUS_FAILED')) return 'failed';
-  return 'processing';
-}
-
-function _markAsyncJobs(names, updates) {
-  const nameSet = new Set(names || []);
+function _markAsyncJobs(names, updates, mediaIds) {
   let hit = false;
   for (const entry of requestLog) {
     if (!_ASYNC_SUBMIT_TYPES.has(entry.type)) continue;
-    if (entry.status === 'success' || entry.status === 'failed') continue;
-    const match = (entry.opNames || []).some((n) => nameSet.has(n));
-    if (match) {
-      Object.assign(entry, updates);
-      hit = true;
+    if (entryMatchesSnapshot(entry, { names, mediaIds })) {
+      if (_completeAsyncEntry(entry, updates)) hit = true;
     }
   }
   if (!hit) {
-    const pending = requestLog.find(
+    const pending = requestLog.filter(
       (e) => _ASYNC_SUBMIT_TYPES.has(e.type) && e.status === 'processing',
     );
-    if (pending) Object.assign(pending, updates);
+    // Only guess when a single clip is in-flight — concurrent Omni jobs
+    // would otherwise all inherit the first poll result.
+    if (pending.length === 1 && ((names && names.length) || (mediaIds && mediaIds.length))) {
+      if (_completeAsyncEntry(pending[0], updates)) hit = true;
+    }
   }
-  broadcastRequestLog();
+  if (hit) {
+    chrome.storage.local.set({ metrics });
+    broadcastStatus();
+    broadcastRequestLog();
+  }
+}
+
+function _applyProjectSnapshotToLog(payload) {
+  const items = projectSnapshotTerminals(payload);
+  if (!items.length) return;
+  let hit = false;
+  for (const item of items) {
+    for (const entry of requestLog) {
+      if (!_ASYNC_SUBMIT_TYPES.has(entry.type)) continue;
+      if (!entryMatchesSnapshot(entry, item)) continue;
+      if (_completeAsyncEntry(entry, { status: item.status, error: item.error })) {
+        hit = true;
+      }
+    }
+  }
+  if (hit) {
+    chrome.storage.local.set({ metrics });
+    broadcastStatus();
+    broadcastRequestLog();
+  }
 }
 
 function broadcastRequestLog() {
@@ -188,7 +220,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
   },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*', 'https://flow.google.com/*'] },
   ['requestHeaders', 'extraHeaders'],
 );
 
@@ -216,7 +248,7 @@ let _openingFlowTab = false;
 
 async function captureTokenFromFlowTab() {
   const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+    url: FLOW_TAB_URLS,
   });
   if (!tabs.length) {
     if (_openingFlowTab) {
@@ -226,10 +258,10 @@ async function captureTokenFromFlowTab() {
     _openingFlowTab = true;
     try {
       console.log('[FlowAgent] No Flow tab found — opening one in background');
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
+      await chrome.tabs.create({ url: FLOW_HOME_URL, active: false });
       await sleep(3000);
       const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+        url: FLOW_TAB_URLS,
       });
       if (!retryTabs.length) {
         console.log('[FlowAgent] Flow tab not ready yet after open');
@@ -402,17 +434,17 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
 
 async function solveCaptcha(requestId, captchaAction) {
   const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+    url: FLOW_TAB_URLS,
   });
 
   if (!tabs.length) {
     // Auto-open Flow tab and wait briefly before returning error
     try {
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
+      await chrome.tabs.create({ url: FLOW_HOME_URL, active: false });
       await sleep(3000);
       // Retry tab query after opening
       const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+        url: FLOW_TAB_URLS,
       });
       if (!retryTabs.length) return { error: 'NO_FLOW_TAB' };
       const resp = await Promise.race([
@@ -459,7 +491,7 @@ async function handleTrpcRequest(msg) {
   const { id, params } = msg;
   const { url, method = 'POST', headers = {}, body, responseMode = 'json' } = params;
 
-  if (!url || !url.startsWith('https://labs.google/')) {
+  if (!isFlowPageUrl(url)) {
     sendToAgent({ id, error: 'INVALID_TRPC_URL' });
     return;
   }
@@ -495,6 +527,7 @@ async function handleTrpcRequest(msg) {
       await resp.body?.cancel();
     } else {
       data = await resp.json();
+      if (resp.ok) _applyProjectSnapshotToLog(data);
     }
     chrome.storage.local.set({ metrics });
     updateRequestLog(logId, { status: 'success' });
@@ -612,29 +645,30 @@ async function handleApiRequest(msg) {
     });
 
     const responseSummary = responseText ? responseText.slice(0, 300) : null;
-    const opNames = _opNamesFromPayload(responseData);
+    const ids = generateIdsFromPayload(responseData);
     if (response.ok) {
       if (_ASYNC_SUBMIT_TYPES.has(logType)) {
-        const terminal = _opsTerminalStatus(responseData);
+        const terminal = opsTerminalStatus(responseData);
+        const asyncMeta = { httpStatus: response.status, responseSummary, opNames: ids.names, mediaIds: ids.mediaIds };
         if (terminal === 'success') {
           if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
-          updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary, opNames });
+          updateRequestLog(logId, { status: 'success', ...asyncMeta });
         } else if (terminal === 'failed') {
           if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'VIDEO_FAILED'; }
-          updateRequestLog(logId, { status: 'failed', error: 'VIDEO_FAILED', httpStatus: response.status, responseSummary, opNames });
+          updateRequestLog(logId, { status: 'failed', error: 'VIDEO_FAILED', ...asyncMeta });
         } else {
           // 200 = accepted / still rendering. Do not badge as done.
-          updateRequestLog(logId, { status: 'processing', httpStatus: response.status, responseSummary, opNames });
+          updateRequestLog(logId, { status: 'processing', ...asyncMeta });
         }
       } else if (logType === 'POLL') {
-        const terminal = _opsTerminalStatus(responseData);
-        const names = opNames.length ? opNames : _opNamesFromPayload(body);
+        const terminal = opsTerminalStatus(responseData);
+        const fromBody = generateIdsFromPayload(body);
+        const names = ids.names.length ? ids.names : fromBody.names;
+        const mediaIds = ids.mediaIds.length ? ids.mediaIds : fromBody.mediaIds;
         if (terminal === 'success') {
-          if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
-          _markAsyncJobs(names, { status: 'success' });
+          _markAsyncJobs(names, { status: 'success' }, mediaIds);
         } else if (terminal === 'failed') {
-          if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'VIDEO_FAILED'; }
-          _markAsyncJobs(names, { status: 'failed', error: 'VIDEO_FAILED' });
+          _markAsyncJobs(names, { status: 'failed', error: 'VIDEO_FAILED' }, mediaIds);
         }
       } else {
         if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
@@ -644,7 +678,7 @@ async function handleApiRequest(msg) {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
       updateRequestLog(logId, { status: 'failed', error: `API_${response.status}`, httpStatus: response.status, responseSummary });
       if (_ASYNC_SUBMIT_TYPES.has(logType)) {
-        updateRequestLog(logId, { opNames });
+        updateRequestLog(logId, { opNames: ids.names, mediaIds: ids.mediaIds });
       }
     }
   } catch (e) {
@@ -716,13 +750,13 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'OPEN_FLOW_TAB') {
     chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+      url: FLOW_TAB_URLS,
     }).then((tabs) => {
       if (tabs.length) {
         chrome.tabs.update(tabs[0].id, { active: true });
         reply({ ok: true, tabId: tabs[0].id });
       } else {
-        chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow' })
+        chrome.tabs.create({ url: FLOW_HOME_URL })
           .then((tab) => reply({ ok: true, tabId: tab.id }))
           .catch((e) => reply({ error: e.message }));
       }
@@ -782,6 +816,11 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
 function handleTrpcMediaUrls(trpcUrl, bodyText) {
   try {
+    try {
+      _applyProjectSnapshotToLog(JSON.parse(bodyText));
+    } catch {
+      /* body is not always JSON */
+    }
     // Extract all fresh GCS signed URLs
     const urlRegex = /https:\/\/storage\.googleapis\.com\/ai-sandbox-videofx\/(?:image|video)\/[0-9a-f-]{36}\?[^"'\s]+/g;
     const matches = bodyText.match(urlRegex) || [];

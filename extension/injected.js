@@ -1,6 +1,6 @@
 /**
- * Injected into MAIN world on labs.google — has access to window.grecaptcha
- * Also intercepts TRPC fetch responses to capture fresh signed media URLs.
+ * Injected into MAIN world on Flow pages — has access to window.grecaptcha.
+ * Also intercepts TRPC fetch responses for media URLs and project snapshots.
  */
 const SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
@@ -14,10 +14,14 @@ window.fetch = async function (...args) {
   try {
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
     // Only intercept TRPC calls on labs.google that return project/flow data
-    if (url.includes('/fx/api/trpc/') && response.ok) {
+    const isTrpc = url.includes('/fx/api/trpc/') || url.includes('/api/trpc/');
+    if (isTrpc && response.ok) {
       const clone = response.clone();
       clone.text().then(text => {
-        if (text.includes('storage.googleapis.com/ai-sandbox-videofx/')) {
+        const isProject = url.includes('projectInitialData') || url.includes('flow.project');
+        const hasMedia = text.includes('storage.googleapis.com/ai-sandbox-videofx/')
+          || text.includes('mediaGenerationStatus');
+        if (isProject || hasMedia) {
           window.dispatchEvent(new CustomEvent('TRPC_MEDIA_URLS', {
             detail: { url, body: text },
           }));

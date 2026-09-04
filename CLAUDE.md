@@ -2,6 +2,8 @@
 
 Private. Not Gavana. Not public. Test Google account only — see `docs/ACCOUNTS.md`.
 
+Portable operating manual for any agent (including other users): **`docs/AGENT.md`**. Read that first if you are not already following the `/fk-*` skills below.
+
 Base URL: `http://127.0.0.1:8100`
 
 ## Pre-flight

@@ -2,6 +2,8 @@
 
 Workflow skills for AI agents and humans. Each skill is a step-by-step recipe.
 
+**Other users / other agents:** start with [`docs/AGENT.md`](../docs/AGENT.md) (health, Veo vs Omni, critical rules). Then come here for the matching `fk-*` recipe.
+
 ## Pipeline (run in order)
 
 | # | Skill | File | Description |

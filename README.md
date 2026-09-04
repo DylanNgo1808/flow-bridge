@@ -6,7 +6,21 @@ Private copy of [crisng95/flowkit](https://github.com/crisng95/flowkit) (MIT) fo
 - **Not Gavana.** Do not use this to generate lookalike campaign ads. Gavana lives in `gavana-content-pipeline` and uses official brand files only.
 - **Not Joy.** This is not the D2C brand-story factory.
 
-Chrome extension + local Python agent. The extension is a browser bridge to Google Flow (`labs.google/fx/tools/flow`). Credit, quota, and ToS sit on the Google account you sign into — so **test only with a dedicated account**. See [`docs/ACCOUNTS.md`](docs/ACCOUNTS.md).
+Chrome extension + local Python agent. The extension is a browser bridge to Google Flow (`https://flow.google.com/`; `labs.google/fx/tools/flow` still works). Credit, quota, and ToS sit on the Google account you sign into — so **test only with a dedicated account**. See [`docs/ACCOUNTS.md`](docs/ACCOUNTS.md).
+
+## For your AI agent
+
+Copy [`docs/AGENT.md`](docs/AGENT.md) into the agent's instructions. That file is the operating manual: health check, Veo batch pipeline, Omni Flash / `@me`, critical rules, and error routing.
+
+| Tool | How to attach |
+|------|----------------|
+| Claude Code | `@docs/AGENT.md` in `CLAUDE.md`, or paste it |
+| Codex CLI | `@docs/AGENT.md` in `AGENTS.md`, or paste it |
+| Cursor | Add `docs/AGENT.md` as a project rule |
+| Gemini CLI | Paste into `GEMINI.md` |
+| Any session | `@` the file, or paste it at the start |
+
+Inside this repo, `python setup.py --tool all` also generates `/fk-*` slash commands from `skills/`. The agent should still follow `docs/AGENT.md` first.
 
 ## Hard rules
 

@@ -32,7 +32,8 @@ def trim_video(input_path: str, output_path: str, start: float, end: float) -> b
         "-movflags", "+faststart",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         logger.error("Trim failed: %s", result.stderr[-200:])
         return False
@@ -56,7 +57,8 @@ def merge_videos(video_paths: list[str], output_path: str) -> bool:
             "-movflags", "+faststart",
             output_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
     finally:
         Path(concat_file).unlink(missing_ok=True)
     if result.returncode != 0:
@@ -84,7 +86,7 @@ def add_narration(video_path: str, narration_path: str, output_path: str,
 
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )
     try:
         duration = float(probe.stdout.strip())
@@ -103,7 +105,8 @@ def add_narration(video_path: str, narration_path: str, output_path: str,
         "-movflags", "+faststart",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         logger.error("Add narration failed: %s", result.stderr[-200:])
         return False
@@ -127,7 +130,7 @@ def add_music(video_path: str, music_path: str, output_path: str,
 
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )
     try:
         duration = float(probe.stdout.strip())
@@ -146,7 +149,8 @@ def add_music(video_path: str, music_path: str, output_path: str,
         "-movflags", "+faststart",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         logger.error("Add music failed: %s", result.stderr[-200:])
         return False

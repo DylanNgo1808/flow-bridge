@@ -126,7 +126,7 @@ If 400 (missing refs): retry without character_names.
 
 ```bash
 for i in 1 2 3 4; do
-  ffmpeg -y -i "${OUTDIR}/thumbnails/thumbnail_v${i}.png" \
+  ffmpeg -nostdin -y -i "${OUTDIR}/thumbnails/thumbnail_v${i}.png" \
     -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black" \
     "${OUTDIR}/thumbnails/thumbnail_v${i}_yt.png" 2>/dev/null
 done

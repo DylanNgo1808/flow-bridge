@@ -66,11 +66,18 @@ Verify each download: `ffprobe` should return valid video stream.
 
 ## Step 6: Normalize + mix audio
 
+**Every ffmpeg call below is per-scene, so you will run them in a loop — and
+ffmpeg reads stdin.** Inside `while read ... done < list`, ffmpeg swallows the
+rest of the list and the loop silently processes every other scene. This has
+happened: 6 of 12 scenes were dropped with no error. Hence `-nostdin` on every
+invocation here; keep it if you rewrite these commands.
+
+
 ### Option A: Without TTS (default)
 Preserve original video audio (sound effects from Google Flow):
 ```bash
 # CANONICAL = "${OUTDIR}/4k/scene_${IDX3}_${SCENE_ID}.mp4" (set in Step 4)
-ffmpeg -y -i "$CANONICAL" \
+ffmpeg -nostdin -y -i "$CANONICAL" \
   -c:v libx264 -preset fast -crf 18 \
   -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2" \
   -r 24 -pix_fmt yuv420p \
@@ -87,7 +94,7 @@ TTS_WAV="${OUTDIR}/tts/scene_${IDX3}_${SCENE_ID}.wav"
 
 if [ -f "$TTS_WAV" ]; then
   # MIX: video SFX at 30% volume + TTS narrator at 150% volume
-  ffmpeg -y -i "$CANONICAL" -i "$TTS_WAV" \
+  ffmpeg -nostdin -y -i "$CANONICAL" -i "$TTS_WAV" \
     -filter_complex "[0:a]volume=0.3[bg];[1:a]volume=1.5[fg];[bg][fg]amix=inputs=2:duration=first[aout]" \
     -map 0:v -map "[aout]" \
     -c:v libx264 -preset fast -crf 18 \
@@ -97,7 +104,7 @@ if [ -f "$TTS_WAV" ]; then
     -movflags +faststart "${OUTDIR}/narrated/scene_${IDX3}_${SCENE_ID}.mp4"
 else
   # No TTS for this scene — normalize with original audio only
-  ffmpeg -y -i "$CANONICAL" \
+  ffmpeg -nostdin -y -i "$CANONICAL" \
     -c:v libx264 -preset fast -crf 18 \
     -vf "scale=${W}:${H}" -r 24 -pix_fmt yuv420p \
     -c:a aac -b:a 192k \
@@ -109,33 +116,102 @@ fi
 
 ## Step 7: Create concat list and merge
 
+Replace `<VID>` below with the same `<video_id>` supplied to `/fk-concat` and
+used in Step 1. Run this block as a unit. Any error aborts the workflow: do not
+continue to Step 8 or report success. An existing final file may belong to a
+previous run and is not evidence that this concat succeeded.
+
+The subshell keeps its cleanup trap separate from any surrounding shell traps.
+Each invocation uses a unique temporary directory for all three intermediate
+files, preventing concurrent runs from exchanging scene lists. The directory is
+removed on success, failure, or a handled signal; the final output stays in
+`OUTDIR`. Keep the parentheses and run the whole block together.
+
 ```bash
+(
+VIDEO_ID="<VID>"  # Substitute the input video_id used in Step 1
+if [ -z "$VIDEO_ID" ] || [ "$VIDEO_ID" = "<VID>" ]; then
+  echo "ERROR: video_id is missing; use the /fk-concat input from Step 1." >&2
+  exit 1
+fi
+
+if ! CONCAT_TMPDIR=$(mktemp -d); then
+  echo "ERROR: could not create concat temporary directory; concat aborted." >&2
+  exit 1
+fi
+trap 'rm -rf -- "$CONCAT_TMPDIR" || { echo "ERROR: could not remove concat temporary directory: $CONCAT_TMPDIR" >&2; exit 1; }' EXIT
+trap 'echo "ERROR: concat interrupted; concat aborted." >&2; exit 1' HUP INT TERM
+
 # Use narrated/ if --with-tts, otherwise norm/
 SRC_DIR="${OUTDIR}/narrated"  # or "${OUTDIR}/norm"
 
-> concat.txt
-# scenes array must be sorted by display_order; each entry has display_order and id
-for scene in "${SCENES[@]}"; do
-  IDX3=$(printf "%03d" "${scene[display_order]}")
-  SCENE_ID="${scene[id]}"
+# `: >` not a bare `>`: in zsh a redirection with no command runs NULLCMD (cat),
+# which blocks on stdin — the same trap this step warns about.
+if ! : > "${CONCAT_TMPDIR}/concat.txt"; then
+  echo "ERROR: could not create concat list; concat aborted." >&2
+  exit 1
+fi
+# Feed the loop plain "<display_order> <scene_id>" lines, sorted by
+# display_order. Do NOT try to iterate an array of records: bash has no
+# array-of-maps, so ${scene[display_order]} indexes `scene` with the arithmetic
+# value of an unset name — 0 — and every iteration reads the same element.
+# Redirect stdin from the list, not a pipe, so nothing downstream can eat it.
+if ! curl -fsS "http://127.0.0.1:8100/api/scenes?video_id=${VIDEO_ID}" -o "${CONCAT_TMPDIR}/scenes.json"; then
+  echo "ERROR: scene fetch failed for video ${VIDEO_ID}; concat aborted." >&2
+  exit 1
+fi
+if ! python3 -c '
+import sys, json
+scenes = json.load(sys.stdin)
+if not isinstance(scenes, list):
+    raise ValueError("Expected a JSON list of scenes")
+for scene in sorted(scenes, key=lambda s: s["display_order"]):
+    print(scene["display_order"], scene["id"])
+' < "${CONCAT_TMPDIR}/scenes.json" > "${CONCAT_TMPDIR}/scenes.txt"; then
+  echo "ERROR: could not parse scene response for video ${VIDEO_ID}; concat aborted." >&2
+  exit 1
+fi
+if [ ! -s "${CONCAT_TMPDIR}/scenes.txt" ]; then
+  echo "ERROR: no scenes returned for video ${VIDEO_ID}; concat aborted." >&2
+  exit 1
+fi
+
+while read -r ORDER SCENE_ID; do
+  IDX3=$(printf "%03d" "$ORDER")
   CANONICAL_NORM="${SRC_DIR}/scene_${IDX3}_${SCENE_ID}.mp4"
   # Fallback to legacy 2-digit name if canonical not found
-  LEGACY_NORM="${SRC_DIR}/scene_$(printf "%02d" ${scene[display_order]}).mp4"
+  LEGACY_NORM="${SRC_DIR}/scene_$(printf "%02d" "$ORDER").mp4"
   if [ -f "$CANONICAL_NORM" ]; then
-    echo "file '$CANONICAL_NORM'" >> concat.txt
+    NORM_FILE="$CANONICAL_NORM"
   elif [ -f "$LEGACY_NORM" ]; then
-    echo "file '$LEGACY_NORM'" >> concat.txt
+    NORM_FILE="$LEGACY_NORM"
   else
     echo "ERROR: missing normalized file for scene ${IDX3}_${SCENE_ID}" >&2
     exit 1
   fi
-done
+  if ! echo "file '$NORM_FILE'" >> "${CONCAT_TMPDIR}/concat.txt"; then
+    echo "ERROR: could not write concat list; concat aborted." >&2
+    exit 1
+  fi
+done < "${CONCAT_TMPDIR}/scenes.txt" || {
+  echo "ERROR: could not read scene list; concat aborted." >&2
+  exit 1
+}
 
-ffmpeg -y -f concat -safe 0 -i concat.txt -c copy -movflags +faststart \
-  "${OUTDIR}/${SLUG}_final.mp4"
+if ! ffmpeg -nostdin -y -f concat -safe 0 -i "${CONCAT_TMPDIR}/concat.txt" -c copy -movflags +faststart \
+  "${OUTDIR}/${SLUG}_final.mp4"; then
+  echo "ERROR: ffmpeg concat failed; do not verify or report the final file as complete." >&2
+  exit 1
+fi
+)
 ```
 
 ## Step 8: Verify and output
+
+Run this step only after the entire Step 7 block succeeds in this run. If Step 7
+fails, stop even if `${SLUG}_final.mp4` already exists.
+The Step 7 subshell has already cleaned up its temporary lists; verify the final
+file below, without relying on any intermediate files.
 
 ```bash
 # Verify final video
@@ -144,7 +220,7 @@ ls -lh "${OUTDIR}/${SLUG}_final.mp4"
 ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${OUTDIR}/${SLUG}_final.mp4"
 
 # Verify audio is present (not silent)
-ffmpeg -t 10 -i "${OUTDIR}/${SLUG}_final.mp4" -af "volumedetect" -f null /dev/null 2>&1 | grep "mean_volume"
+ffmpeg -nostdin -t 10 -i "${OUTDIR}/${SLUG}_final.mp4" -af "volumedetect" -f null /dev/null 2>&1 | grep "mean_volume"
 # mean_volume should be between -30 and -10 dB (not -inf which means silent)
 ```
 

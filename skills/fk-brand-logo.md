@@ -70,7 +70,7 @@ Intro and outro must match the main video's resolution, fps, and codec for clean
 
 ```bash
 # Normalize intro
-ffmpeg -y -i "$INTRO_FILE" \
+ffmpeg -nostdin -y -i "$INTRO_FILE" \
   -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2" \
   -c:v libx264 -preset fast -crf 18 -r 24 -pix_fmt yuv420p \
   -c:a aac -b:a 192k \
@@ -78,7 +78,7 @@ ffmpeg -y -i "$INTRO_FILE" \
   "/tmp/fk_intro_norm.mp4"
 
 # Normalize outro
-ffmpeg -y -i "$OUTRO_FILE" \
+ffmpeg -nostdin -y -i "$OUTRO_FILE" \
   -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2" \
   -c:v libx264 -preset fast -crf 18 -r 24 -pix_fmt yuv420p \
   -c:a aac -b:a 192k \
@@ -95,7 +95,7 @@ ffmpeg -y -i "$OUTRO_FILE" \
 ```bash
 ffprobe -v quiet -show_entries stream=sample_rate,channels -select_streams a -of csv=p=0 "$VIDEO"
 # If NOT "48000,2" → re-encode audio:
-ffmpeg -y -i "$VIDEO" \
+ffmpeg -nostdin -y -i "$VIDEO" \
   -c:v copy \
   -c:a aac -b:a 192k -ar 48000 -ac 2 \
   -movflags +faststart \
@@ -117,7 +117,7 @@ EOF
 # If --no-intro: remove intro line
 # If --no-outro: remove outro line
 
-ffmpeg -y -f concat -safe 0 -i /tmp/fk_brand_concat.txt \
+ffmpeg -nostdin -y -f concat -safe 0 -i /tmp/fk_brand_concat.txt \
   -c copy -movflags +faststart \
   "/tmp/fk_with_intro_outro.mp4"
 ```
@@ -127,7 +127,7 @@ ffmpeg -y -f concat -safe 0 -i /tmp/fk_brand_concat.txt \
 The logo covers the **Veo watermark** ("V" text) at the bottom-right corner.
 
 ```bash
-ffmpeg -y -i "/tmp/fk_with_intro_outro.mp4" -i "$ICON" \
+ffmpeg -nostdin -y -i "/tmp/fk_with_intro_outro.mp4" -i "$ICON" \
   -filter_complex "[1:v]scale=${SIZE}:${SIZE},format=rgba[icon];[0:v][icon]overlay=W-w-${PAD}:H-h-${PAD}" \
   -c:v libx264 -preset fast -crf 18 -r 24 -pix_fmt yuv420p \
   -c:a copy -movflags +faststart \
@@ -140,7 +140,7 @@ Check for `4k_icon.png` AND source video is 4K (width >= 3840):
 
 ```bash
 if [ -f "$ICON_4K" ] && [ "$RES" -ge 3840 ]; then
-  ffmpeg -y -i "${VIDEO%.mp4}_branded.mp4" -i "$ICON_4K" \
+  ffmpeg -nostdin -y -i "${VIDEO%.mp4}_branded.mp4" -i "$ICON_4K" \
     -filter_complex "[1:v]scale=-1:180,format=rgba[icon4k];[0:v][icon4k]overlay=W-w-40:40" \
     -c:v libx264 -preset fast -crf 18 -r 24 -pix_fmt yuv420p \
     -c:a copy -movflags +faststart \
@@ -156,7 +156,7 @@ PROJ_OUT=$(curl -s http://127.0.0.1:8100/api/projects/<PID>/output-dir)
 OUTDIR=$(echo "$PROJ_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])")
 
 for thumb in "${OUTDIR}/thumbnails/thumbnail_v"*_yt.png; do
-  ffmpeg -y -i "$thumb" -i "$ICON" \
+  ffmpeg -nostdin -y -i "$thumb" -i "$ICON" \
     -filter_complex "[1:v]scale=72:72[icon];[0:v][icon]overlay=W-w-16:H-h-16" \
     "${thumb%_yt.png}_final.png" 2>/dev/null
 done

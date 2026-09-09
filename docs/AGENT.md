@@ -12,8 +12,9 @@ Gemini CLI    copy into GEMINI.md
 Any session   paste this file at the start, or @-mention it
 ```
 
-Human setup (Chrome + agent process) is in [README.md](../README.md) and
-[ACCOUNTS.md](ACCOUNTS.md). You (the agent) talk only to `http://127.0.0.1:8100`.
+First-run setup (you guide the human through Chrome + the Python agent) is in
+[README.md](../README.md) and [ACCOUNTS.md](ACCOUNTS.md). You (the agent) talk
+only to `http://127.0.0.1:8100`.
 
 ---
 

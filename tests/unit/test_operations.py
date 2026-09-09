@@ -373,3 +373,53 @@ class TestSingleton:
         instance = init_operations(mock_client, mock_repo)
         retrieved = get_operations()
         assert retrieved is instance
+
+
+# ---------------------------------------------------------------------------
+# Resume-handle tagging (_persist_token / _parse_persist_token)
+# ---------------------------------------------------------------------------
+
+from agent.sdk.services.operations import (  # noqa: E402
+    _persist_token,
+    _parse_persist_token,
+    WORKFLOW_TOKEN_PREFIX,
+)
+
+
+class TestPersistToken:
+    def test_legacy_operation_round_trips_untagged(self):
+        op = {"operation": {"name": "models/veo/operations/abc123"}}
+        stored = _persist_token(op)
+        assert stored == "models/veo/operations/abc123"
+        assert _parse_persist_token(stored) == (False, "models/veo/operations/abc123")
+
+    def test_workflow_round_trips_tagged(self):
+        op = {
+            "operation": {"name": "workflows/w1"},
+            "_workflow_mode": True,
+            "_primary_media_id": "123e4567-e89b-12d3-a456-426614174000",
+        }
+        stored = _persist_token(op)
+        assert stored.startswith(WORKFLOW_TOKEN_PREFIX)
+        assert _parse_persist_token(stored) == (True, "123e4567-e89b-12d3-a456-426614174000")
+
+    def test_workflow_without_primary_media_id_falls_back_to_name(self):
+        op = {"operation": {"name": "workflows/w1"}, "_workflow_mode": True}
+        assert _parse_persist_token(_persist_token(op)) == (True, "workflows/w1")
+
+    def test_tag_survives_an_id_that_is_not_a_uuid(self):
+        """The point of tagging: shape no longer decides which poller runs."""
+        op = {
+            "operation": {"name": "w1"},
+            "_workflow_mode": True,
+            "_primary_media_id": "not-a-uuid-at-all",
+        }
+        assert _parse_persist_token(_persist_token(op)) == (True, "not-a-uuid-at-all")
+
+    def test_untagged_bare_uuid_still_reads_as_workflow(self):
+        """Rows written before tagging existed must keep resuming correctly."""
+        legacy = "123e4567-e89b-12d3-a456-426614174000"
+        assert _parse_persist_token(legacy) == (True, legacy)
+
+    def test_empty_token_is_not_a_workflow(self):
+        assert _parse_persist_token("") == (False, "")

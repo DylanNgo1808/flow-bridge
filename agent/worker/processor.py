@@ -8,17 +8,33 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
 from agent.db import crud
 from agent.services.flow_client import get_flow_client
 from agent.services.event_bus import event_bus
-from agent.config import POLL_INTERVAL, MAX_RETRIES, API_COOLDOWN, MAX_CONCURRENT_REQUESTS
+from agent.config import (POLL_INTERVAL, MAX_RETRIES, API_COOLDOWN, MAX_CONCURRENT_REQUESTS,
+                          STALE_PROCESSING_TIMEOUT)
 from agent.worker._parsing import _is_error
 from agent.sdk.services.result_handler import parse_result, apply_scene_result, apply_character_result
 
 logger = logging.getLogger(__name__)
+
+# How often to look for orphaned PROCESSING rows. Well under the staleness
+# threshold so a stuck request is recovered promptly once it qualifies.
+SWEEP_INTERVAL = max(POLL_INTERVAL, min(60, STALE_PROCESSING_TIMEOUT / 4))
+
+# reCAPTCHA gets a longer budget than MAX_RETRIES: its failures are transient
+# far more often than a real generation error is.
+CAPTCHA_MAX_RETRIES = 10
+BACKOFF_CAP_SECONDS = 300
+
+
+def _backoff_seconds(retry: int) -> float:
+    """Exponential backoff, capped. Shared by every retry path."""
+    return min(2 ** retry * 10, BACKOFF_CAP_SECONDS)
 
 _API_CALL_TYPES = {"GENERATE_IMAGE", "REGENERATE_IMAGE", "EDIT_IMAGE",
                    "GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS", "UPSCALE_VIDEO",
@@ -31,6 +47,17 @@ _TYPE_PRIORITY = {
     "GENERATE_VIDEO": 2, "REGENERATE_VIDEO": 2, "GENERATE_VIDEO_REFS": 2,
     "UPSCALE_VIDEO": 3,
 }
+
+
+def _age_seconds(timestamp: str, now: datetime = None) -> float | None:
+    """Age in seconds of a crud timestamp ('%Y-%m-%dT%H:%M:%SZ'), or None if unparseable."""
+    if not timestamp:
+        return None
+    try:
+        ts = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return ((now or datetime.now(timezone.utc)) - ts).total_seconds()
 
 
 class APIRateLimiter:
@@ -61,7 +88,7 @@ class WorkerController:
         self._active_ids: set[str] = set()
         self._rate_limiter = APIRateLimiter(MAX_CONCURRENT_REQUESTS, API_COOLDOWN)
         self._deferred: dict[str, float] = {}  # rid -> defer_until timestamp
-        self._retry_after: dict[str, float] = {}  # rid -> retry_after timestamp
+        self._last_sweep: float = 0.0  # monotonic ts of last stale sweep
 
     @property
     def active_count(self) -> int:
@@ -98,6 +125,40 @@ class WorkerController:
         except Exception as e:
             logger.warning("Could not clean up stale requests: %s", e)
 
+    async def _sweep_stale_processing(self):
+        """Recover requests left in PROCESSING by something that never called back.
+
+        The extension's MV3 service worker can be killed mid-request — Chrome
+        terminates it after 30s of idle, and separately when a fetch() transfers
+        no bytes for 30s. When that happens no reply ever arrives and the row
+        sits in PROCESSING forever, which is what `docs/AGENT.md` describes as
+        "Stuck PROCESSING > 10 min".
+
+        Rows backed by a live in-flight task are skipped, so the timeout only
+        has to outlast a missing callback, never a slow generation.
+        """
+        try:
+            rows = await crud.list_requests(status="PROCESSING")
+        except Exception as e:
+            logger.warning("Could not sweep stale requests: %s", e)
+            return
+
+        now = datetime.now(timezone.utc)
+        for req in rows:
+            rid = req["id"]
+            if rid in self._active_ids:
+                continue
+            age = _age_seconds(req.get("updated_at"), now)
+            if age is None or age < STALE_PROCESSING_TIMEOUT:
+                continue
+            reset = await crud.reset_processing_request(
+                rid,
+                error_message=f"reset: stale PROCESSING for {int(age)}s (no callback)",
+            )
+            if reset:
+                logger.warning("Stale request reset: %s type=%s age=%ds",
+                               rid[:8], req.get("type"), int(age))
+
     async def _run_loop(self):
         client = get_flow_client()
 
@@ -108,6 +169,14 @@ class WorkerController:
                     continue
 
                 now = time.time()
+
+                # Orphan recovery. Throttled: the condition it looks for takes
+                # STALE_PROCESSING_TIMEOUT to arise, so polling it every tick
+                # would be pure overhead.
+                if now - self._last_sweep >= SWEEP_INTERVAL:
+                    self._last_sweep = now
+                    await self._sweep_stale_processing()
+
                 slots_available = MAX_CONCURRENT_REQUESTS - len(self._active_ids)
                 if slots_available <= 0:
                     await asyncio.sleep(POLL_INTERVAL)
@@ -142,18 +211,13 @@ class WorkerController:
                         continue
                     self._deferred.pop(rid, None)
 
-                    # Skip if retry backoff not elapsed
-                    if rid in self._retry_after and self._retry_after[rid] > now:
-                        continue
-
                     self._active_ids.add(rid)
                     slots_available -= 1
                     asyncio.create_task(self._run_one(req))
 
-                # Prune stale deferred/retry entries for requests no longer pending
+                # Prune stale deferred entries for requests no longer pending
                 pending_ids = {r["id"] for r in pending}
                 self._deferred = {k: v for k, v in self._deferred.items() if k in pending_ids}
-                self._retry_after = {k: v for k, v in self._retry_after.items() if k in pending_ids}
 
             except Exception as e:
                 logger.exception("Worker loop error: %s", e)
@@ -165,7 +229,7 @@ class WorkerController:
         try:
             await self._rate_limiter.acquire()
             try:
-                await _process_one(req, self._deferred, self._retry_after)
+                await _process_one(req, self._deferred)
             finally:
                 self._rate_limiter.release()
         finally:
@@ -229,7 +293,7 @@ async def _resolve_orientation(req: dict) -> str:
     return "VERTICAL"
 
 
-async def _process_one(req: dict, deferred: dict = None, retry_after: dict = None):
+async def _process_one(req: dict, deferred: dict = None):
     rid, req_type = req["id"], req["type"]
     orientation = await _resolve_orientation(req)
 
@@ -271,7 +335,7 @@ async def _process_one(req: dict, deferred: dict = None, retry_after: dict = Non
     try:
         result = await _dispatch(req, orientation)
         if _is_error(result):
-            await _handle_failure(rid, req, result, retry_after)
+            await _handle_failure(rid, req, result)
         else:
             gen_result = parse_result(result, req_type)
             await crud.update_request(rid, status="COMPLETED", media_id=gen_result.media_id, output_url=gen_result.url)
@@ -286,7 +350,7 @@ async def _process_one(req: dict, deferred: dict = None, retry_after: dict = Non
     except Exception as e:
         logger.exception("Request %s exception: %s", rid[:8], e)
         await event_bus.emit("request_update", {"id": rid, "status": "FAILED", "error": str(e)})
-        await _handle_failure(rid, req, {"error": str(e)}, retry_after)
+        await _handle_failure(rid, req, {"error": str(e)})
 
 
 async def _dispatch(req: dict, orientation: str) -> dict:
@@ -411,7 +475,7 @@ async def _recover_entity_not_found(req: dict) -> bool:
     return False
 
 
-async def _handle_failure(rid: str, req: dict, result: dict, retry_after: dict = None):
+async def _handle_failure(rid: str, req: dict, result: dict):
     error_msg = result.get("error")
     if not error_msg:
         data = result.get("data", {})
@@ -450,30 +514,31 @@ async def _handle_failure(rid: str, req: dict, result: dict, retry_after: dict =
         logger.info("Request %s transient WS error, will retry (no retry increment): %s", rid[:8], error_msg)
         return
 
-    # reCAPTCHA errors: retry up to 10 times — deferred dict in main loop handles delay
+    # reCAPTCHA errors get their own, longer retry budget: the token is single-use
+    # and scored on behaviour, so a failure is usually transient. It must still
+    # back off — retrying immediately hammers reCAPTCHA and drives the score
+    # (and therefore the pass rate) down, making the problem worse.
     if "captcha" in error_lower or "recaptcha" in error_lower:
         retry = req.get("retry_count", 0) + 1
-        if retry < 10:
-            await crud.update_request(rid, status="PENDING", retry_count=retry, error_message=str(error_msg))
-            logger.warning("Request %s reCAPTCHA failed (retry %d/10), will retry", rid[:8], retry)
+        if retry < CAPTCHA_MAX_RETRIES:
+            next_retry_at = (datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(retry))).strftime("%Y-%m-%dT%H:%M:%SZ")
+            await crud.update_request(rid, status="PENDING", retry_count=retry,
+                                      error_message=str(error_msg), next_retry_at=next_retry_at)
+            logger.warning("Request %s reCAPTCHA failed (retry %d/%d), backing off %ds",
+                           rid[:8], retry, CAPTCHA_MAX_RETRIES, int(_backoff_seconds(retry)))
             return
         else:
             await crud.update_request(rid, status="FAILED", error_message=str(error_msg))
             await _mark_scene_failed(req)
-            logger.error("Request %s FAILED after 10 reCAPTCHA retries: %s", rid[:8], error_msg)
+            logger.error("Request %s FAILED after %d reCAPTCHA retries: %s",
+                         rid[:8], CAPTCHA_MAX_RETRIES, error_msg)
             return
 
     retry = req.get("retry_count", 0) + 1
     if retry < MAX_RETRIES:
-        now = time.time()
-        if retry_after is not None:
-            ra = retry_after.get(rid, 0.0)
-            if ra > now:
-                # Still in backoff — reset to PENDING so it's not stuck in PROCESSING
-                await crud.update_request(rid, status="PENDING", error_message=str(error_msg))
-                return
-            retry_after[rid] = now + min(2 ** retry * 10, 300)
-        await crud.update_request(rid, status="PENDING", retry_count=retry, error_message=str(error_msg))
+        next_retry_at = (datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(retry))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        await crud.update_request(rid, status="PENDING", retry_count=retry,
+                                  error_message=str(error_msg), next_retry_at=next_retry_at)
         logger.warning("Request %s failed (retry %d/%d): %s", rid[:8], retry, MAX_RETRIES, error_msg)
     else:
         await crud.update_request(rid, status="FAILED", error_message=str(error_msg))

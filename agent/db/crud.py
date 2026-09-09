@@ -249,6 +249,18 @@ async def create_request(req_type: str, orientation: str = None,
 async def get_request(rid: str): return await _get("request", "id", rid)
 async def update_request(rid: str, **kw): return await _update("request", "id", rid, **kw)
 
+async def reset_processing_request(rid: str, error_message: str) -> bool:
+    """Reset an orphan only if it is still PROCESSING at update time."""
+    db = await get_db()
+    async with _db_lock:
+        cur = await db.execute(
+            "UPDATE request SET status='PENDING', error_message=?, updated_at=? WHERE id=? AND status='PROCESSING'",
+            (error_message, _now(), rid),
+        )
+        await db.commit()
+    return cur.rowcount > 0
+
+
 async def list_requests(scene_id: str = None, status: str = None,
                         video_id: str = None, project_id: str = None) -> list[dict]:
     db = await get_db()

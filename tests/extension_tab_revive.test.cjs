@@ -25,6 +25,10 @@ const messagedTabs = [];
 let tabState = [];
 let tabsCreated = 0;
 let onReload = (tab) => { tab.discarded = false; };
+// Tabs whose page has finished lazy-loading window.grecaptcha.enterprise.
+const grecaptchaTabs = new Set();
+// Tabs whose readiness probe never answers — a page stuck loading.
+const hangingProbes = new Set();
 let onGet = () => {};
 const flowTab = (id, discarded) => ({ id, discarded, status: 'complete', url: 'https://flow.google.com/' });
 
@@ -52,9 +56,15 @@ const chrome = {
     sendMessage: async () => {},
   },
   scripting: {
-    executeScript: async ({ target }) => {
+    executeScript: async ({ target, world }) => {
       const tab = tabState.find(t => t.id === target.tabId);
       if (!tab || tab.discarded) throw new Error('No tab with id: ' + target.tabId);
+      // A MAIN-world call is the grecaptcha readiness probe, not an injection —
+      // keep it out of `scripted`, which tracks content.js injections.
+      if (world === 'MAIN') {
+        if (hangingProbes.has(target.tabId)) return new Promise(() => {});
+        return [{ result: grecaptchaTabs.has(target.tabId) }];
+      }
       scripted.push(target.tabId);
       return [{ result: null }];
     },
@@ -147,6 +157,39 @@ setImmediate(async () => {
   await vm.runInContext("solveCaptcha('req-3', 'IMAGE_GENERATION')", context);
   assert.deepEqual(reloaded, [], 'with a live tab available there is nothing to revive');
   assert.deepEqual(messagedTabs, [12], 'the live tab must be preferred');
+
+  // ── prefer the tab that actually has grecaptcha ─────────────────────────
+  // "status: complete" is the document, not the captcha library: the Flow app
+  // lazy-loads grecaptcha long after load, and a backgrounded tab's throttled
+  // timers stretch that out. Picking the first merely-loaded tab sent captcha
+  // work to a tab that could only answer "grecaptcha not available".
+  tabState = [flowTab(13, false), flowTab(14, false)];
+  reloaded.length = 0;
+  messagedTabs.length = 0;
+  grecaptchaTabs.add(14);
+  await vm.runInContext("solveCaptcha('req-3b', 'IMAGE_GENERATION')", context);
+  assert.deepEqual(messagedTabs, [14],
+    'the tab with grecaptcha loaded must win over the merely-loaded first tab');
+  grecaptchaTabs.clear();
+
+  // With none ready, the first candidate still gets the work — injected.js does
+  // the waiting, inside the captcha timeout budget.
+  tabState = [flowTab(15, false), flowTab(16, false)];
+  messagedTabs.length = 0;
+  await vm.runInContext("solveCaptcha('req-3c', 'IMAGE_GENERATION')", context);
+  assert.deepEqual(messagedTabs, [15],
+    'with no ready tab, fall back to the first candidate rather than failing');
+
+  // A candidate whose probe never answers must not hide the ready tab behind it.
+  tabState = [flowTab(17, false), flowTab(18, false)];
+  messagedTabs.length = 0;
+  hangingProbes.add(17);
+  grecaptchaTabs.add(18);
+  await vm.runInContext("solveCaptcha('req-3d', 'IMAGE_GENERATION')", context);
+  assert.deepEqual(messagedTabs, [18],
+    'a stalled probe must time out, not block selection of a ready tab');
+  hangingProbes.clear();
+  grecaptchaTabs.clear();
 
   // ── token refresh against a discarded tab ───────────────────────────────
   tabState = [flowTab(21, true)];

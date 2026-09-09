@@ -63,7 +63,12 @@ window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   }
 });
 
-function waitForGrecaptcha(timeout = 10000) {
+// 20s, not 10s: a backgrounded Flow tab has its timers throttled, so both this
+// poll and the page's own lazy load of grecaptcha stretch out. Must stay under
+// content.js's CONTENT_TIMEOUT (25s), which is itself under background.js's
+// CAPTCHA_TIMEOUT (30s) — the innermost wait has to lose the race, or the outer
+// timeouts mask the real reason with a generic timeout.
+function waitForGrecaptcha(timeout = 20000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const check = () => {

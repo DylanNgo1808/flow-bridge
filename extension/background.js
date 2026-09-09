@@ -527,6 +527,34 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
   }
 }
 
+/** True when the enterprise reCAPTCHA library is actually callable in a tab.
+ *  chrome.tabs "status: complete" only means the document finished — the Flow
+ *  app lazy-loads grecaptcha well after that, so "complete" is not readiness.
+ *
+ *  The probe is bounded twice over, because it runs before solveCaptcha starts
+ *  its 30s race and would otherwise extend that budget instead of fitting in
+ *  it: injectImmediately skips executeScript's default wait for document idle,
+ *  which on a still-loading tab blocks until the page settles, and the timeout
+ *  keeps one unresponsive candidate from hiding a ready one behind it.
+ */
+async function grecaptchaReady(tabId, timeout = 1500) {
+  try {
+    const [res] = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        injectImmediately: true,
+        func: () => !!window.grecaptcha?.enterprise?.execute,
+      }),
+      sleep(timeout).then(() => [{ result: false }]),
+    ]);
+    return !!res?.result;
+  } catch {
+    // Tab closed, discarded mid-probe, or not scriptable — treat as not ready.
+    return false;
+  }
+}
+
 /** Pick a usable Flow tab, waking a discarded one if that is all there is.
  *  Chrome auto-discards backgrounded tabs to reclaim memory, and this extension
  *  opens its Flow tab in the background itself, so this is the ordinary case on
@@ -535,24 +563,46 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
  *  solveCaptcha that surfaces as CONTENT_TIMEOUT, which the worker then charges
  *  to the reCAPTCHA retry budget — a dead tab is indistinguishable from a
  *  refused captcha. A reload re-hydrates it.
+ *
+ *  With requireCaptcha, a tab that already has grecaptcha is preferred over one
+ *  that merely finished loading: a hydrated but backgrounded tab has throttled
+ *  timers and can take far longer than the page load to expose
+ *  window.grecaptcha.enterprise, so "status: complete" picked the wrong tab when
+ *  a ready one was sitting right next to it. Waiting for it is left to
+ *  injected.js, which already does so inside the captcha timeout budget —
+ *  waiting here would stack on top of that budget instead.
  */
-async function pickFlowTab(tabs) {
-  const live = tabs.find((t) => !t.discarded);
-  if (live) return live;
-  for (const stale of tabs) {
-    try {
-      await chrome.tabs.reload(stale.id);
-      for (let check = 0; check < 10; check++) {
-        await sleep(500);
-        const tab = await chrome.tabs.get(stale.id);
-        if (!tab || !/^https:\/\/(flow\.google\.com\/|labs\.google\/fx\/(?:[^/]+\/)?tools\/flow)/.test(tab.url || '')) break;
-        if (!tab.discarded && tab.status === 'complete') return tab;
+async function pickFlowTab(tabs, { requireCaptcha = false } = {}) {
+  const candidates = tabs.filter((t) => !t.discarded);
+
+  if (!candidates.length) {
+    for (const stale of tabs) {
+      try {
+        await chrome.tabs.reload(stale.id);
+        for (let check = 0; check < 10; check++) {
+          await sleep(500);
+          const tab = await chrome.tabs.get(stale.id);
+          if (!tab || !/^https:\/\/(flow\.google\.com\/|labs\.google\/fx\/(?:[^/]+\/)?tools\/flow)/.test(tab.url || '')) break;
+          if (!tab.discarded && tab.status === 'complete') {
+            candidates.push(tab);
+            break;
+          }
+        }
+      } catch {
+        // The tab may have closed mid-reload; try the next candidate.
       }
-    } catch {
-      // The tab may have closed mid-reload; try the next candidate.
+      if (candidates.length) break;
     }
   }
-  return null;
+
+  if (!candidates.length) return null;
+  if (!requireCaptcha) return candidates[0];
+
+  for (const tab of candidates) {
+    if (await grecaptchaReady(tab.id)) return tab;
+  }
+  // None ready yet — hand back the best candidate and let injected.js wait.
+  return candidates[0];
 }
 
 async function solveCaptcha(requestId, captchaAction) {
@@ -569,7 +619,7 @@ async function solveCaptcha(requestId, captchaAction) {
       const retryTabs = await chrome.tabs.query({
         url: FLOW_TAB_URLS,
       });
-      const openedTab = await pickFlowTab(retryTabs);
+      const openedTab = await pickFlowTab(retryTabs, { requireCaptcha: true });
       if (!openedTab) return { error: 'NO_FLOW_TAB' };
       const resp = await Promise.race([
         requestCaptchaFromTab(openedTab.id, requestId, captchaAction),
@@ -582,7 +632,7 @@ async function solveCaptcha(requestId, captchaAction) {
   }
 
   try {
-    const tab = await pickFlowTab(tabs);
+    const tab = await pickFlowTab(tabs, { requireCaptcha: true });
     if (!tab) return { error: 'FLOW_TAB_DISCARDED' };
     const resp = await Promise.race([
       requestCaptchaFromTab(tab.id, requestId, captchaAction),

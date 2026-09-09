@@ -5,6 +5,7 @@ Agent runs a WS server. Extension connects as client. Agent sends API requests,
 extension executes them in browser context (residential IP, cookies, reCAPTCHA).
 """
 import asyncio
+import os
 import json
 import logging
 import time
@@ -18,6 +19,19 @@ from agent.config import (
 from agent.services.headers import random_headers
 
 logger = logging.getLogger(__name__)
+
+# Minimum gap between paygate-tier syncs. The tier is near-static; the trigger
+# that used to drive it (token_captured) fires many times a minute.
+TIER_SYNC_MIN_INTERVAL = float(os.environ.get("TIER_SYNC_MIN_INTERVAL", "900"))
+
+# Credits barely move, but /api/flow/credits is polled hard: the Claude Code
+# statusline (scripts/statusline.sh) fetches it on every refresh, and each miss
+# is a real request through the extension to Google — which also flips the
+# toolbar badge to running. Measured on an idle system: 106 credits calls and 98
+# extension round-trips in under four minutes with no work queued.
+CREDITS_CACHE_TTL = float(os.environ.get("CREDITS_CACHE_TTL", "60"))
+TIER_SYNC_RETRY_INTERVAL = 30.0
+TIER_SYNC_CACHE_SIZE = 128
 
 
 class FlowClient:
@@ -35,6 +49,13 @@ class FlowClient:
         self._ws_connected_at: Optional[float] = None
         self._ws_last_disconnect_at: Optional[float] = None
         self._last_flow_generate: Optional[dict] = None
+        self._credits_cache: Optional[dict] = None
+        self._credits_cached_at: float = 0.0
+        self._credits_cache_key: Optional[str] = None
+        self._tier_synced_at: dict[str, float] = {}
+        self._tier_failed_at: dict[str, float] = {}
+        self._tier_sync_tasks: dict[str, asyncio.Task] = {}
+        self._tier_sync_lock = asyncio.Lock()
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -183,12 +204,12 @@ class FlowClient:
                 self._extension_ws = source_ws
             self._flow_key = key
             logger.info("Flow key captured from extension")
-            asyncio.create_task(self._sync_tier())
+            self._maybe_sync_tier()
             return
 
         if data.get("type") == "extension_ready":
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
-            asyncio.create_task(self._sync_tier())
+            self._maybe_sync_tier()
             return
 
         if data.get("type") == "flow_generate_capture":
@@ -224,28 +245,52 @@ class FlowClient:
                 self._pending[req_id].set_result(data)
             return
 
-    async def _sync_tier(self):
-        """Detect current tier from credits API and update all active projects."""
-        if getattr(self, '_sync_in_progress', False):
+    def _maybe_sync_tier(self):
+        """Deduplicate captures per key, including queued and in-flight syncs."""
+        key = self._flow_key
+        if not key or key in self._tier_sync_tasks:
             return
-        self._sync_in_progress = True
-        try:
-            result = await self.get_credits()
-            data = result.get("data", result)
-            tier = data.get("userPaygateTier", "PAYGATE_TIER_ONE")
-            logger.info("Syncing tier: %s", tier)
+        now = time.monotonic()
+        if now - self._tier_synced_at.get(key, float("-inf")) < TIER_SYNC_MIN_INTERVAL:
+            return
+        if now - self._tier_failed_at.get(key, float("-inf")) < TIER_SYNC_RETRY_INTERVAL:
+            return
+        self._tier_sync_tasks[key] = asyncio.create_task(self._sync_tier(key))
 
-            from agent.db import crud
-            projects = await crud.list_projects(status="ACTIVE")
-            for p in projects:
-                if p.get("user_paygate_tier") != tier:
-                    await crud.update_project(p["id"], user_paygate_tier=tier)
-                    logger.info("Updated project %s tier: %s -> %s",
-                                p["id"][:12], p.get("user_paygate_tier"), tier)
-        except Exception as e:
-            logger.warning("Failed to sync tier: %s", e)
+    async def _sync_tier(self, key: str):
+        """Sync the captured key after any earlier sync, then record success."""
+        try:
+            async with self._tier_sync_lock:
+                try:
+                    result = await self.get_credits(flow_key=key)
+                    data = result.get("data", result)
+                    if (result.get("error") or result.get("status", 200) != 200
+                            or not isinstance(data, dict) or data.get("error")):
+                        raise ValueError("Credits request failed")
+                    tier = data.get("userPaygateTier", "PAYGATE_TIER_ONE")
+                    logger.info("Syncing tier: %s", tier)
+
+                    from agent.db import crud
+                    projects = await crud.list_projects(status="ACTIVE")
+                    for p in projects:
+                        if p.get("user_paygate_tier") != tier:
+                            await crud.update_project(p["id"], user_paygate_tier=tier)
+                            logger.info("Updated project %s tier: %s -> %s",
+                                        p["id"][:12], p.get("user_paygate_tier"), tier)
+                except Exception as e:
+                    self._tier_failed_at.pop(key, None)
+                    self._tier_failed_at[key] = time.monotonic()
+                    logger.warning("Failed to sync tier: %s", e)
+                else:
+                    self._tier_failed_at.pop(key, None)
+                    self._tier_synced_at.pop(key, None)
+                    self._tier_synced_at[key] = time.monotonic()
+                # Bound both successful and failed token histories across rotations.
+                for history in (self._tier_synced_at, self._tier_failed_at):
+                    while len(history) > TIER_SYNC_CACHE_SIZE:
+                        del history[next(iter(history))]
         finally:
-            self._sync_in_progress = False
+            self._tier_sync_tasks.pop(key, None)
 
     _UUID_RE = __import__("re").compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
     _SAFE_URL_RE = __import__("re").compile(r'^https://(storage\.googleapis\.com|lh3\.googleusercontent\.com)/')
@@ -323,7 +368,8 @@ class FlowClient:
                 "Video reviewer uses get_media fallback automatically. "
                 "For URL refresh, open the project in Google Flow in Chrome."}
 
-    async def _send(self, method: str, params: dict, timeout: float = 300) -> dict:
+    async def _send(self, method: str, params: dict, timeout: float = 300,
+                    flow_key: Optional[str] = None) -> dict:
         """Send request to extension and wait for response.
 
         Always returns a dict. On error, returns {"error": "<reason>"} — callers
@@ -334,6 +380,10 @@ class FlowClient:
             return {"error": "Extension not connected"}
 
         extension_candidates = self._extension_candidates(require_token=True)
+        if flow_key is not None:
+            # A tier result must belong to the key whose freshness we cache.
+            extension_candidates = [ws for ws in extension_candidates
+                                    if self._extensions[ws].get("flow_key") == flow_key]
         if not extension_candidates:
             return {"error": "NO_FLOW_KEY"}
 
@@ -657,14 +707,38 @@ class FlowClient:
             "body": body,
         }, timeout=30)  # No captcha needed
 
-    async def get_credits(self) -> dict:
-        """Get user credits and tier."""
+    async def get_credits(self, flow_key: Optional[str] = None,
+                          force: bool = False) -> dict:
+        """Get user credits and tier, cached for CREDITS_CACHE_TTL.
+
+        Cached per flow key, so a different account never reads the previous
+        one's balance. Errors are never cached — a transient failure must not
+        pin a bad answer for the whole window. Pass force=True right after an
+        action that is expected to have changed the balance.
+        """
+        key = flow_key or self._flow_key
+        now = time.time()
+        if (not force
+                and self._credits_cache is not None
+                and self._credits_cache_key == key
+                and now - self._credits_cached_at < CREDITS_CACHE_TTL):
+            return self._credits_cache
+
         url = self._build_url("get_credits")
-        return await self._send("api_request", {
+        result = await self._send("api_request", {
             "url": url,
             "method": "GET",
             "headers": random_headers(),
-        }, timeout=15)
+        }, timeout=15, flow_key=key)
+
+        data = result.get("data", result)
+        if (not _is_ws_error(result)
+                and isinstance(data, dict) and not data.get("error")
+                and ("credits" in data or "userPaygateTier" in data)):
+            self._credits_cache = result
+            self._credits_cached_at = now
+            self._credits_cache_key = key
+        return result
 
     async def validate_media_id(self, media_id: str) -> bool:
         """Check if a mediaId is still valid.

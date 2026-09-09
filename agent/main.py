@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import signal
 from contextlib import asynccontextmanager
 
 import websockets
@@ -91,12 +90,12 @@ async def lifespan(app: FastAPI):
 
     controller = get_worker_controller()
 
-    # SIGTERM handler for graceful shutdown (Unix only)
-    try:
-        loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGTERM, controller.request_shutdown)
-    except (NotImplementedError, AttributeError):
-        pass
+    # No SIGTERM handler here on purpose. uvicorn installs its own, which runs
+    # the lifespan teardown below — request_shutdown, drain, cancel, close_db —
+    # and then exits. Registering one here REPLACED uvicorn's, and because
+    # request_shutdown only sets the worker's asyncio.Event, the HTTP and WS
+    # servers kept listening forever: `kill <pid>` looked like it did nothing and
+    # the next start died with "address already in use" on 8100/18765.
 
     # Start background tasks
     ws_task = asyncio.create_task(run_ws_server())

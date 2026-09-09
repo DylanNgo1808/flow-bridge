@@ -1,6 +1,23 @@
 """Shared pytest fixtures for Flow Kit tests."""
 
+import asyncio
+
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def close_shared_db():
+    """Close the process-wide aiosqlite connection when the session ends.
+
+    aiosqlite runs each connection on its own non-daemon thread. A test that
+    reaches the real database — usually by leaving one crud call unmocked —
+    leaves that thread alive, and pytest then prints its summary and hangs
+    forever instead of exiting. This is the backstop; a test touching the DB at
+    all is still a bug in that test.
+    """
+    yield
+    from agent.db.schema import close_db
+    asyncio.run(close_db())
 
 
 @pytest.fixture

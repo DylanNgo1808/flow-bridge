@@ -90,12 +90,19 @@ mkdir -p "${OUTDIR}/trimmed" "${OUTDIR}/norm"
 
 ## Step 6: Trim + normalize + mix audio (per scene)
 
+**These run per scene, so you will loop them — and ffmpeg reads stdin.** Inside
+`while read ... done < list`, ffmpeg swallows the rest of the list and the loop
+silently skips every other scene, with no error to notice. That is why every
+invocation here carries `-nostdin`; keep it if you rewrite them. See
+`skills/fk-concat.md` Step 7 for a loop shape that survives this.
+
+
 For each scene, single ffmpeg pass — trim, normalize resolution, and mix TTS:
 
 ### Scene WITH TTS:
 
 ```bash
-ffmpeg -y -ss 1 -i "$VIDEO_FILE" -i "$TTS_WAV" \
+ffmpeg -nostdin -y -ss 1 -i "$VIDEO_FILE" -i "$TTS_WAV" \
   -t ${CUT_DUR} \
   -filter_complex "[0:a]volume=0.3[bg];[1:a]volume=1.5[fg];[bg][fg]amix=inputs=2:duration=first[aout]" \
   -map 0:v -map "[aout]" \
@@ -118,7 +125,7 @@ ffmpeg -y -ss 1 -i "$VIDEO_FILE" -i "$TTS_WAV" \
 ### Scene WITHOUT TTS (keep full duration):
 
 ```bash
-ffmpeg -y -i "$VIDEO_FILE" \
+ffmpeg -nostdin -y -i "$VIDEO_FILE" \
   -ss 1 \
   -c:v libx264 -preset fast -crf 18 \
   -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2" \
@@ -171,7 +178,7 @@ Place text in the **upper-middle** area of the video (not bottom):
 ### ffmpeg command (example with 2 text lines, center alignment, 4K):
 
 ```bash
-ffmpeg -y -i "${OUTDIR}/trimmed/scene_${IDX3}_${SCENE_ID}.mp4" \
+ffmpeg -nostdin -y -i "${OUTDIR}/trimmed/scene_${IDX3}_${SCENE_ID}.mp4" \
   -vf "drawtext=text='${TEXT1}':fontfile=/System/Library/Fonts/Supplemental/Arial\ Bold.ttf:fontsize=84:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=h*0.25:enable='between(t,0.5,${END})',drawtext=text='${TEXT2}':fontfile=/System/Library/Fonts/Supplemental/Arial\ Bold.ttf:fontsize=84:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=h*0.25+120:enable='between(t,0.5,${END})'" \
   -c:v libx264 -preset fast -crf 18 -c:a copy \
   -movflags +faststart \
@@ -255,7 +262,7 @@ for segment in segments:
     chain_out = f"{OUTDIR}/trimmed/chain_{segment_index:03d}.mp4"
     
     # Step 2: Run xfade
-    ffmpeg -y {' '.join(f'-i {f}' for f in segment)} \
+    ffmpeg -nostdin -y {' '.join(f'-i {f}' for f in segment)} \
       -filter_complex "{fc}" \
       -map '[vout]' -map '[aout]' \
       -c:v libx264 -preset fast -crf 18 -c:a aac -ar 48000 -ac 2 \
@@ -271,7 +278,7 @@ for segment in segments:
 for part in final_parts:
     echo "file '${part}'" >> concat_trimmed.txt
 
-ffmpeg -y -f concat -safe 0 -i concat_trimmed.txt -c copy -movflags +faststart \
+ffmpeg -nostdin -y -f concat -safe 0 -i concat_trimmed.txt -c copy -movflags +faststart \
   "${OUTDIR}/${SLUG}_narrator_cut.mp4"
 ```
 
@@ -286,7 +293,7 @@ ls -lh "${OUTDIR}/${SLUG}_narrator_cut.mp4"
 ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${OUTDIR}/${SLUG}_narrator_cut.mp4"
 
 # Verify audio is present
-ffmpeg -t 10 -i "${OUTDIR}/${SLUG}_narrator_cut.mp4" -af "volumedetect" -f null /dev/null 2>&1 | grep "mean_volume"
+ffmpeg -nostdin -t 10 -i "${OUTDIR}/${SLUG}_narrator_cut.mp4" -af "volumedetect" -f null /dev/null 2>&1 | grep "mean_volume"
 # mean_volume should be between -30 and -10 dB (not -inf)
 ```
 

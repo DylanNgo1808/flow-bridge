@@ -171,7 +171,8 @@ def _extract_frames(video_path: str, fps: float, out_dir: str) -> list:
         "-q:v", "4",
         f"{out_dir}/frame_%04d.jpg",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg frame extraction failed: {result.stderr[-500:]}")
     return sorted(Path(out_dir).glob("frame_*.jpg"))
@@ -199,7 +200,8 @@ def _create_contact_sheets(video_path: str, fps: float, out_dir: str) -> tuple[l
         "-q:v", "2",
         f"{frames_dir}/frame_%04d.jpg",
     ]
-    result = subprocess.run(extract_cmd, capture_output=True, text=True)
+    result = subprocess.run(extract_cmd, capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         raise RuntimeError(f"Frame extraction failed: {result.stderr[-500:]}")
 
@@ -230,7 +232,8 @@ def _create_contact_sheets(video_path: str, fps: float, out_dir: str) -> tuple[l
             "-vf", f"tile={cols_eff}x{rows_eff}:nb_frames={len(chunk)}",
             "-q:v", "2", str(output),
         ]
-        result = subprocess.run(tile_cmd, capture_output=True, text=True)
+        result = subprocess.run(tile_cmd, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
         if result.returncode != 0:
             raise RuntimeError(f"Contact sheet tiling failed: {result.stderr[-500:]}")
         sheets.append(output)

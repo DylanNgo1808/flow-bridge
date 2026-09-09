@@ -78,7 +78,7 @@ Match against taxonomy — even partial matches (`"not found"`, `"captcha"`, `"q
 | `PUBLIC_ERROR_MODEL_ACCESS_DENIED` | Tier mismatch (TIER_ONE trying Veo 3 / Upscale) | Terminal FAILED | `GET /api/flow/credits` to check tier; `/fk-change-model` to downgrade |
 | `Requested entity was not found` | Uploaded `media_id` expired (~1h TTL on uploads) | `_recover_entity_not_found` re-uploads from `image_url`, re-queues PENDING | If auto-recovery fails: manually `POST /api/upload-image`, patch `media_id` |
 | `Internal error encountered` | Flow backend transient 500 | Exponential backoff: `2^retry * 10s`, capped 300s | None — wait, or retry manually after a minute |
-| `reCAPTCHA failed` / (contains `captcha`) | Extension couldn't solve reCAPTCHA | Retry ≤10× without consuming `retry_count` (processor.py:454-464) | Ensure a Google Flow tab is open and focused; reload extension |
+| `reCAPTCHA failed` / (contains `captcha`) | Extension couldn't solve reCAPTCHA | Retry up to `CAPTCHA_MAX_RETRIES` (10) with exponential backoff, `retry_count` IS consumed (`_handle_failure`) | Ensure a Google Flow tab is open. A **discarded** background tab used to look identical to a refused captcha; `pickFlowTab` now reloads it first, so repeated captcha failures today mean a real trust-signal problem — see `PUBLIC_ERROR_UNUSUAL_ACTIVITY` |
 | `PUBLIC_ERROR_UNUSUAL_ACTIVITY` (403, message `reCAPTCHA evaluation failed`) | Google flagged the session as bot-like — usually triggered by rapid bursts of submits (e.g. many GENERATE_VIDEO in <1 minute), shared/VPN IP, or stale auth cookies | NOT auto-handled — Google blocks even fresh requests until the trust signal recovers | (1) **Stop the worker / pipeline** so submits pause. (2) Open Chrome → `chrome://settings/cookies` (or the extension's Chrome profile) → search `google.com` and `labs.google` → **remove all cookies for both**. (3) Reload `https://labs.google/fx/tools/flow` and sign back in (re-solve any reCAPTCHA puzzles manually). (4) Slow down submission cadence (≥1s gap between submits, ≤5 concurrent). If still blocked, switch to a different network or wait 1–6 h |
 
 ### B. HTTP status codes
@@ -107,10 +107,6 @@ Detection lives in `agent/worker/_parsing.py:_is_error`. A result is treated as 
 | `Extension not connected` | WS dropped or extension offline | Reload extension at `chrome://extensions`; worker auto-retries |
 | `extension reconnected` / `extension disconnected` | WS bounce mid-request | Auto re-queue, `retry_count` NOT incremented |
 | `extension_switched` | User switched active Flow tab | Auto re-queue |
-| `NO_FLOW_KEY` | No bearer token captured | Open `labs.google/fx/tools/flow` and sign in |
-| `NO_FLOW_TAB` | No Flow tab for CAPTCHA solve | Open any Flow tab |
-| `Failed to fetch` | Network drop inside service worker | Auto-retry with backoff |
-| WS 60s timeout | Extension hung | Reload extension; worker re-queues |
 
 ### D. YouTube upload errors (`youtube/upload.py`)
 
@@ -152,14 +148,72 @@ When the user describes a symptom in plain language, map it here first.
 | Python `cryptography` arch mismatch | Use `python3.10`, not `python3.13` (x86/arm64 binary mismatch) |
 | `curl: (7) Failed to connect to 127.0.0.1:8100` | Agent not running — `python -m agent.main` |
 
+## Transport migration — the failure that looks like everything else
+
+Flow Bridge authenticates by sniffing a `Bearer ya29.…` off the page and calling
+`aisandbox-pa.googleapis.com`. Upstream
+([crisng95/flowkit](https://github.com/crisng95/flowkit)) reports that the
+rewritten `flow.google.com` frontend **stopped minting that token in September
+2026** and moved to a `batchexecute` endpoint signed in-page with the session
+cookie plus `WIZ_global_data.SNlM0e`. As of the last check this fork's REST path
+still answers, so treat the following as a watch list, not a diagnosis.
+
+Start with these checks; neither alone establishes a transport migration:
+
+```bash
+curl -s http://127.0.0.1:8100/api/flow/status   # {"connected":true,"flow_key_present":true}
+curl -s http://127.0.0.1:8100/api/flow/credits  # should return a credits number
+```
+
+| What you see | Reading |
+|---|---|
+| `flow_key_present: false` **while a signed-in Flow tab is open**, and it stays false across a `REFRESH_TOKEN` | **INCONCLUSIVE**: refresh only re-injects `content.js`; neither it nor `injected.js` initiates an authenticated request. An idle page can leave this false while REST still works |
+| The `/api/flow/credits` response **body** contains an upstream 401/403 error with a valid-looking key | **INCONCLUSIVE**: an expired `ya29.` token still looks syntactically valid; inspect the error message and reason |
+| Every request type fails at once, image and video alike, with a healthy WS and a signed-in tab | **INCONCLUSIVE**: shared authentication, network, or service failures can affect all request types |
+
+`GET /api/flow/credits` returns `result.get("data", result)` without propagating
+the upstream status: an upstream 401/403 in `data.error` is returned as **HTTP
+200 with an error body**. A top-level client `error` becomes 502; a disconnected
+extension becomes 503. Read the actual JSON error body, never infer success or
+migration from the endpoint's HTTP status alone.
+
+Before diagnosing migration, capture the Flow UI's network traffic while
+performing a **fresh authenticated action** (for example, a generation), not
+just loading the page or sending `REFRESH_TOKEN`. Confirm that no
+`Authorization: Bearer ya29.…` request is observed during that action, and
+identify the replacement authenticated transport actually used by the UI.
+Inspect the `/api/flow/credits` error body alongside that capture and rule out
+ordinary causes below. Missing headers on an idle page or a credits auth error
+alone is not positive evidence and does not justify a port.
+
+Distinguish from the ordinary causes first: `NO_FLOW_KEY` right after a browser
+restart is normal (open a Flow tab); a single failing model is a tier problem;
+`PUBLIC_ERROR_UNUSUAL_ACTIVITY` is a trust signal, not a transport change.
+
+If it really is the migration, the port target is upstream's
+`agent/services/flow_batch.py` plus the `batch_rpc` handler in its
+`extension/background.js`. `docs/CAPTURE.md` holds the workflow for recording
+the RPC shapes. Note upstream has **not** yet captured video upscale, r2v, or
+start+end-frame chaining, so `/fk-gen-chain-videos`, `/fk-review-video` upscale
+and r2v reference generation do not survive the port as-is.
+
+| `NO_FLOW_KEY` | No bearer token captured | Open `labs.google/fx/tools/flow` and sign in |
+| `NO_FLOW_TAB` | No Flow tab for CAPTCHA solve | Open any Flow tab |
+| `Failed to fetch` | Network drop inside service worker | Auto-retry with backoff |
+| WS 60s timeout | Extension hung | Reload extension; worker re-queues |
+
 ## Worker retry policy (`processor.py:_handle_failure`)
 
 Decision order — stop at first match:
 
 1. **`"not found"` in message** → `_recover_entity_not_found()` re-uploads media, marks PENDING.
 2. **`reconnected` / `disconnected` / `switched`** → PENDING, keep `retry_count`.
-3. **`captcha` / `recaptcha`** → PENDING if retry_count < 10; else FAILED.
-4. **Default** → increment `retry_count`; if < `MAX_RETRIES` (5), schedule retry at `now + min(2^retry * 10, 300)`s. Else FAILED.
+3. **`captcha` / `recaptcha`** → increment `retry_count`; if < `CAPTCHA_MAX_RETRIES` (10), PENDING with a backoff deadline. Else FAILED. Captcha gets double the generic budget because its failures are usually transient, but it backs off like everything else — retrying instantly drives the reCAPTCHA score down and makes the next attempt likelier to fail too.
+4. **Default** → increment `retry_count`; if < `MAX_RETRIES` (5), PENDING with a backoff deadline. Else FAILED.
+
+Backoff is `min(2^retry * 10, 300)`s and is written to the **`request.next_retry_at` column**, which `crud.list_actionable_requests` filters on. It is deliberately not held in memory: the worker loop rebuilds its in-memory maps every tick, so an in-process deadline set by a long-running request was silently discarded and the request retried immediately.
+
+Orphan recovery: `_sweep_stale_processing` runs every 60s and returns any row that has been `PROCESSING` longer than `STALE_PROCESSING_TIMEOUT` (600s) to `PENDING` — but only rows this worker is not actually running, so a slow generation is never cut short. The usual cause of an orphan is the extension's MV3 service worker being killed mid-request.
 
 ## Output format
 

@@ -32,6 +32,7 @@ let flowKey = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
+let manualDisconnectRevision = 0;
 let metrics = {
   tokenCapturedAt: null,
   requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
@@ -164,7 +165,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'reconnect') connectToAgent();
   if (alarm.name === 'keepAlive') keepAlive();
   if (alarm.name === 'token-refresh') {
-    await captureTokenFromFlowTab();
+    // Refresh runs even while the agent is down so the key does not expire,
+    // but never after the operator hit Disconnect — it can open a Flow tab.
+    if (!manualDisconnect) await captureTokenFromFlowTab();
   }
 });
 
@@ -179,7 +182,12 @@ function ensureInitialized() {
 }
 
 async function initialize() {
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'lastFlowGenerate']);
+  const preferenceRevision = manualDisconnectRevision;
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'lastFlowGenerate', 'manualDisconnect']);
+  // A user action during the read takes precedence over its stored snapshot.
+  if (manualDisconnectRevision === preferenceRevision) {
+    manualDisconnect = data.manualDisconnect === true;
+  }
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
@@ -188,7 +196,20 @@ async function initialize() {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   }
   connectToAgent();
-  chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+  try {
+    await chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+  } catch (error) {
+    console.warn('[FlowAgent] Failed to arm keepAlive alarm', error);
+  }
+  // Token refresh is independent of the agent connection: the Flow key expires
+  // on Google's clock, not ours. Preserve its deadline across worker restarts.
+  try {
+    if (!await chrome.alarms.get('token-refresh')) {
+      await chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
+    }
+  } catch (error) {
+    console.warn('[FlowAgent] Failed to arm token-refresh alarm', error);
+  }
 }
 
 // MV3 workers can be suspended and restarted without onStartup firing.
@@ -250,6 +271,7 @@ async function captureTokenFromFlowTab() {
   const tabs = await chrome.tabs.query({
     url: FLOW_TAB_URLS,
   });
+  if (manualDisconnect) return;
   if (!tabs.length) {
     if (_openingFlowTab) {
       console.log('[FlowAgent] Flow tab already opening, skipping');
@@ -263,12 +285,13 @@ async function captureTokenFromFlowTab() {
       const retryTabs = await chrome.tabs.query({
         url: FLOW_TAB_URLS,
       });
-      if (!retryTabs.length) {
+      const openedTab = await pickFlowTab(retryTabs);
+      if (!openedTab) {
         console.log('[FlowAgent] Flow tab not ready yet after open');
         return;
       }
       await chrome.scripting.executeScript({
-        target: { tabId: retryTabs[0].id },
+        target: { tabId: openedTab.id },
         files: ['content.js'],
       });
       console.log('[FlowAgent] Token refresh triggered on newly opened Flow tab');
@@ -280,13 +303,87 @@ async function captureTokenFromFlowTab() {
     return;
   }
   try {
+    const tab = await pickFlowTab(tabs);
+    if (!tab) {
+      console.log('[FlowAgent] Flow tab discarded and could not be revived');
+      return;
+    }
     await chrome.scripting.executeScript({
-      target: { tabId: tabs[0].id },
+      target: { tabId: tab.id },
       files: ['content.js'],
     });
     console.log('[FlowAgent] Token refresh triggered on Flow tab');
   } catch (e) {
     console.error('[FlowAgent] Token refresh failed:', e);
+  }
+}
+
+// ─── Service Worker Keep-Alive ──────────────────────
+// Chrome terminates an MV3 worker after 30s idle, and separately when a fetch()
+// transfers no bytes for 30s (crbug.com/40283184). The 'keepAlive' alarm cannot
+// prevent either: an alarm only revives a worker that already died, and the
+// in-flight request is gone with it. Pulsing a chrome.* API resets the idle
+// timer while a request is actually running, which is the documented
+// workaround. Ref-counted because up to MAX_CONCURRENT_REQUESTS run at once.
+
+const KEEPALIVE_PULSE_MS = 20000; // < 30s idle timeout, with slack
+let keepAliveDepth = 0;
+let keepAliveTimer = null;
+
+function beginKeepAlive() {
+  keepAliveDepth++;
+  if (keepAliveTimer !== null) return;
+  keepAliveTimer = setInterval(() => {
+    // Any chrome.* call resets the idle timer; getPlatformInfo is the cheapest.
+    chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
+  }, KEEPALIVE_PULSE_MS);
+}
+
+function endKeepAlive() {
+  if (keepAliveDepth > 0) keepAliveDepth--;
+  if (keepAliveDepth === 0 && keepAliveTimer !== null) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+
+// The badge tracks the same bracket as the pulse. It used to be written by each
+// handler individually, so with MAX_CONCURRENT_REQUESTS in flight the first one
+// to finish reported 'idle' while the others were still running.
+//
+// Dropping to idle the instant the socket goes quiet was still wrong for what
+// the badge is read for. A video generation is one api_request to submit and
+// then a status poll every VIDEO_POLL_INTERVAL (10s) for several minutes, so a
+// literal reading blinked ~40 times per clip while the work never stopped.
+// Holding 'running' across a gap longer than one poll cycle makes the badge mean
+// "there is work in progress", at the cost of reporting done up to
+// IDLE_LINGER_MS late.
+const IDLE_LINGER_MS = 15000; // > VIDEO_POLL_INTERVAL (10s), so polls do not gap
+let idleLingerTimer = null;
+
+function cancelIdleLinger() {
+  if (idleLingerTimer !== null) {
+    clearTimeout(idleLingerTimer);
+    idleLingerTimer = null;
+  }
+}
+
+async function withKeepAlive(fn) {
+  cancelIdleLinger();
+  beginKeepAlive();
+  if (keepAliveDepth === 1 && state !== 'running') setState('running');
+  try {
+    return await fn();
+  } finally {
+    endKeepAlive();
+    if (keepAliveDepth === 0) {
+      cancelIdleLinger();
+      idleLingerTimer = setTimeout(() => {
+        idleLingerTimer = null;
+        // Re-check: work may have arrived while the linger was pending.
+        if (keepAliveDepth === 0 && state === 'running') setState('idle');
+      }, IDLE_LINGER_MS);
+    }
   }
 }
 
@@ -308,10 +405,8 @@ function connectToAgent() {
   ws.onopen = () => {
     console.log('[FlowAgent] Connected to agent');
     chrome.alarms.clear('reconnect');
-    setState('idle');
-
-    // Token refresh alarm — 45 min gives buffer before ~60 min expiry
-    chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
+    // A reconnect mid-batch must not claim idle while requests are in flight.
+    setState(keepAliveDepth > 0 ? 'running' : 'idle');
 
     // Send current state + resend token if we have one
     ws.send(JSON.stringify({
@@ -329,11 +424,11 @@ function connectToAgent() {
       const msg = JSON.parse(data);
 
       if (msg.method === 'api_request') {
-        await handleApiRequest(msg);
+        await withKeepAlive(() => handleApiRequest(msg));
       } else if (msg.method === 'trpc_request') {
-        await handleTrpcRequest(msg);
+        await withKeepAlive(() => handleTrpcRequest(msg));
       } else if (msg.method === 'solve_captcha') {
-        await handleSolveCaptcha(msg);
+        await withKeepAlive(() => handleSolveCaptcha(msg));
       } else if (msg.method === 'get_status') {
         sendToAgent({
           id: msg.id,
@@ -358,8 +453,8 @@ function connectToAgent() {
   };
 
   ws.onclose = () => {
+    cancelIdleLinger();
     setState('off');
-    chrome.alarms.clear('token-refresh');
     if (!manualDisconnect) scheduleReconnect();
   };
 
@@ -432,6 +527,34 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
   }
 }
 
+/** Pick a usable Flow tab, waking a discarded one if that is all there is.
+ *  Chrome auto-discards backgrounded tabs to reclaim memory, and this extension
+ *  opens its Flow tab in the background itself, so this is the ordinary case on
+ *  a long session. A discarded tab still comes back from chrome.tabs.query, but
+ *  sendMessage and executeScript into it throw "No tab with id". During
+ *  solveCaptcha that surfaces as CONTENT_TIMEOUT, which the worker then charges
+ *  to the reCAPTCHA retry budget — a dead tab is indistinguishable from a
+ *  refused captcha. A reload re-hydrates it.
+ */
+async function pickFlowTab(tabs) {
+  const live = tabs.find((t) => !t.discarded);
+  if (live) return live;
+  for (const stale of tabs) {
+    try {
+      await chrome.tabs.reload(stale.id);
+      for (let check = 0; check < 10; check++) {
+        await sleep(500);
+        const tab = await chrome.tabs.get(stale.id);
+        if (!tab || !/^https:\/\/(flow\.google\.com\/|labs\.google\/fx\/(?:[^/]+\/)?tools\/flow)/.test(tab.url || '')) break;
+        if (!tab.discarded && tab.status === 'complete') return tab;
+      }
+    } catch {
+      // The tab may have closed mid-reload; try the next candidate.
+    }
+  }
+  return null;
+}
+
 async function solveCaptcha(requestId, captchaAction) {
   const tabs = await chrome.tabs.query({
     url: FLOW_TAB_URLS,
@@ -446,9 +569,10 @@ async function solveCaptcha(requestId, captchaAction) {
       const retryTabs = await chrome.tabs.query({
         url: FLOW_TAB_URLS,
       });
-      if (!retryTabs.length) return { error: 'NO_FLOW_TAB' };
+      const openedTab = await pickFlowTab(retryTabs);
+      if (!openedTab) return { error: 'NO_FLOW_TAB' };
       const resp = await Promise.race([
-        requestCaptchaFromTab(retryTabs[0].id, requestId, captchaAction),
+        requestCaptchaFromTab(openedTab.id, requestId, captchaAction),
         new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
       ]);
       return resp;
@@ -458,8 +582,10 @@ async function solveCaptcha(requestId, captchaAction) {
   }
 
   try {
+    const tab = await pickFlowTab(tabs);
+    if (!tab) return { error: 'FLOW_TAB_DISCARDED' };
     const resp = await Promise.race([
-      requestCaptchaFromTab(tabs[0].id, requestId, captchaAction),
+      requestCaptchaFromTab(tab.id, requestId, captchaAction),
       new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
     ]);
     return resp;
@@ -496,7 +622,6 @@ async function handleTrpcRequest(msg) {
     return;
   }
 
-  setState('running');
   // TRPC calls don't consume captcha — don't count in metrics
 
   const logId = id;
@@ -537,8 +662,6 @@ async function handleTrpcRequest(msg) {
     chrome.storage.local.set({ metrics });
     updateRequestLog(logId, { status: 'failed', error: e.message || 'TRPC_FETCH_FAILED' });
     sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
-  } finally {
-    setState('idle');
   }
 }
 
@@ -556,7 +679,6 @@ async function handleApiRequest(msg) {
     return;
   }
 
-  setState('running');
   const hasCaptcha = !!captchaAction;
   if (hasCaptcha) metrics.requestCount++;
 
@@ -581,7 +703,6 @@ async function handleApiRequest(msg) {
         if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
         chrome.storage.local.set({ metrics });
         updateRequestLog(logId, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
-        setState('idle');
         return;
       }
     }
@@ -615,7 +736,6 @@ async function handleApiRequest(msg) {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
       chrome.storage.local.set({ metrics });
       updateRequestLog(logId, { status: 'failed', error: 'NO_FLOW_KEY' });
-      setState('idle');
       return;
     }
 
@@ -692,7 +812,6 @@ async function handleApiRequest(msg) {
   }
 
   chrome.storage.local.set({ metrics });
-  setState('idle');
 }
 
 // ─── State & Popup ──────────────────────────────────────────
@@ -730,14 +849,18 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'DISCONNECT') {
+    manualDisconnectRevision++;
     manualDisconnect = true;
+    chrome.storage.local.set({ manualDisconnect });
     if (ws) ws.close();
     reply({ ok: true });
     return true;
   }
 
   if (msg.type === 'RECONNECT') {
+    manualDisconnectRevision++;
     manualDisconnect = false;
+    chrome.storage.local.set({ manualDisconnect });
     connectToAgent();
     reply({ ok: true });
     return true;

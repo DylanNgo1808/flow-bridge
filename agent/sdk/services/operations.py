@@ -138,6 +138,38 @@ def _extract_operations(result: dict) -> list[dict]:
     return synthesized
 
 
+WORKFLOW_TOKEN_PREFIX = "workflow:"
+
+
+def _persist_token(op: dict) -> str:
+    """Serialize an operation's resume handle, tagged with the schema it belongs to.
+
+    Flow answers a video submit with one of two shapes: the legacy operation
+    ("models/.../operations/...") or a Low-Priority workflow, whose handle is a
+    bare UUID. The two need different polling, so which one this is has to
+    survive the round-trip through the DB — inferring it later from the string's
+    shape is guesswork that breaks the moment Google changes an id format.
+    """
+    op_name = op.get("operation", {}).get("name", "")
+    if op.get("_workflow_mode"):
+        return f"{WORKFLOW_TOKEN_PREFIX}{op.get('_primary_media_id') or op_name}"
+    return op_name
+
+
+def _parse_persist_token(stored: str) -> tuple[bool, str]:
+    """Inverse of _persist_token → (is_workflow, id).
+
+    Rows written before the tag existed carry an untagged value, so fall back to
+    the old shape test for those: a bare 36-char UUID meant workflow mode.
+    """
+    if not stored:
+        return False, ""
+    if stored.startswith(WORKFLOW_TOKEN_PREFIX):
+        return True, stored[len(WORKFLOW_TOKEN_PREFIX):]
+    legacy_uuid = len(stored) == 36 and stored.count("-") == 4
+    return legacy_uuid, stored
+
+
 async def _poll_workflows(
     client: FlowClient,
     operations: list[dict],
@@ -416,31 +448,29 @@ class OperationService:
             base_prompt = scene.get("video_prompt") or scene.get("prompt", "")
         prompt = await _build_video_prompt(base_prompt, scene, pid)
 
-        # Check if already submitted (op_name saved from previous attempt)
-        # OLD schema (Lite/Fast/Ultra): op_name is "models/.../operations/..." → re-poll via check_video_status
-        # NEW schema (Low Priority workflow): op_name is bare UUID → cannot recover (need primary_media_id
-        # which isn't persisted yet); fall through and resubmit (Low Priority is free, duplicate is OK)
+        # Resume handle from a previous attempt, tagged by _persist_token with the
+        # schema it came from: legacy operation, or Low-Priority workflow.
         existing_op = None
         if request_id:
             req_row = await crud.get_request(request_id)
             existing_op = req_row.get("request_id") if req_row else None
 
-        # Bare UUID = workflow name or primaryMediaId. Re-poll the project snapshot.
-        # Do not resubmit — that burns another Lite credit while the first clip is already done.
-        looks_like_workflow_uuid = bool(existing_op and len(existing_op) == 36 and existing_op.count("-") == 4)
-        if existing_op and looks_like_workflow_uuid:
-            logger.info("Video gen already submitted (workflow=%s), re-polling project snapshot", existing_op[:30])
-            operations = [{
-                "operation": {"name": existing_op},
-                "status": "MEDIA_GENERATION_STATUS_PENDING",
-                "_workflow_mode": True,
-                "_primary_media_id": existing_op,
-                "_project_id": pid,
-            }]
-            return await _poll_operations(self._client, operations)
+        # Re-poll whatever was already submitted. Never resubmit: the first clip
+        # may well be finished, and a second submit burns another credit.
         if existing_op:
-            logger.info("Video gen already submitted (op=%s), re-polling", existing_op[:30])
-            operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
+            is_workflow, op_id = _parse_persist_token(existing_op)
+            if is_workflow:
+                logger.info("Video gen already submitted (workflow=%s), re-polling project snapshot", op_id[:30])
+                operations = [{
+                    "operation": {"name": op_id},
+                    "status": "MEDIA_GENERATION_STATUS_PENDING",
+                    "_workflow_mode": True,
+                    "_primary_media_id": op_id,
+                    "_project_id": pid,
+                }]
+            else:
+                logger.info("Video gen already submitted (op=%s), re-polling", op_id[:30])
+                operations = [{"operation": {"name": op_id}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
             return await _poll_operations(self._client, operations)
 
         submit_result = await self._client.generate_video(
@@ -462,10 +492,8 @@ class OperationService:
             logger.error("[DEBUG] Video gen NO_OPERATIONS submit_result: %s", str(submit_result)[:2000])
             return {"error": "Video gen returned no operations"}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
-        persist_id = operations[0].get("_primary_media_id") or op_name
         if request_id:
-            await crud.update_request(request_id, request_id=persist_id)
+            await crud.update_request(request_id, request_id=_persist_token(operations[0]))
         for op in operations:
             op["_project_id"] = pid
 

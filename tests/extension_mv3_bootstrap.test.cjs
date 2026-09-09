@@ -40,7 +40,7 @@ function event(bucket) {
 const chrome = {
   action: { setBadgeBackgroundColor() {}, setBadgeText() {} },
   sidePanel: { setPanelBehavior: async () => {} },
-  alarms: { clear() {}, create() {}, onAlarm: event(lifecycleListeners.alarm) },
+  alarms: { clear() {}, create() {}, async get() { return undefined; }, onAlarm: event(lifecycleListeners.alarm) },
   runtime: {
     onInstalled: event(lifecycleListeners.installed),
     onMessage: event(),

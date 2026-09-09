@@ -1,6 +1,6 @@
 # Flow Bridge (internal)
 
-Private. Not Gavana. Not public. Test Google account only — see `docs/ACCOUNTS.md`.
+Private. Not public. Test Google account only — see `docs/ACCOUNTS.md`.
 
 Portable operating manual for any agent (including other users): **`docs/AGENT.md`**. Read that first if you are not already following the `/fk-*` skills below.
 

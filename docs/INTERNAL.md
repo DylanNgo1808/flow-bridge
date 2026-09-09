@@ -8,13 +8,9 @@ A local Python agent + unpacked Chrome extension that talks to Google Flow for t
 
 ## This is not
 
-| Repo | Job |
-|---|---|
-| `gavana-content-pipeline` | Top-funnel shorts from **official** campaign files. No generated remakes. |
-| `joy-video-content` | D2C brand-story factory. Not this. |
-| Upstream [crisng95/flowkit](https://github.com/crisng95/flowkit) | Public MIT source this tree was copied from. |
+A public product. Do not publish the extension or file a Chrome Web Store listing.
 
-Do not merge this into Gavana. Do not publish the extension. Do not file a Chrome Web Store listing.
+Upstream source: [crisng95/flowkit](https://github.com/crisng95/flowkit) (MIT). This tree is a private copy.
 
 ## License
 

@@ -308,7 +308,6 @@ the worker is still retrying.
 ## Do not
 
 - Load the extension in everyday Chrome or sign the test profile into the main Google account. See `docs/ACCOUNTS.md`.
-- Generate lookalike campaign ads from official brand files (that is a different pipeline).
 - Put real names of public figures into image/video prompts.
 - Stagger Veo jobs by hand or sleep in a `for` loop of curls.
 - Use a caller-local image path with `/api/flow/upload-image` unless that exact file exists on the Flow Bridge machine.
